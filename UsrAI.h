@@ -3,6 +3,11 @@
 
 #include "ai.h"
 #include <unordered_map>
+#include <memory>
+#include <functional>
+#include <vector>
+#include <string>
+#include <initializer_list>
 
 extern tagGame tagUsrGame;
 extern ins UsrIns;
