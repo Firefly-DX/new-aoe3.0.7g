@@ -57,6 +57,7 @@ private:
     std::vector<Task> taskQueue;
     int nextTaskId = 0;
     int phase = 0;                // 阶段状态机：1冲铜器 2发展军事 3反攻
+    bool huntStarted = false;     // 打猎开关（人口/木头到位后锁存，开了一直开）
 
     void sort_tasks();
     void assign_tasks();
@@ -66,6 +67,8 @@ private:
     // 注意：只有当敌方逼近我方城市（enemy_at_home）时才启用，避免祭司探图途中被远处敌军误触发。
     void combat_tactic();
     int convertTargetSN = -1;        // 待转化的敌方单位 SN
+    int convertStuckFrame = 0;                   // 上次检查"祭司是否卡在转化目标上"的帧
+    double convertStuckDR = 0, convertStuckUR = 0;
     int towerFocusSN = -1;           // 箭塔集火目标 SN（仇恨标记，锁定后不切换）
     int scoutCheckFrame = 0;                     // 上次卡住检查的帧号
     double scoutCheckDR = -1, scoutCheckUR = -1; // 上次卡住检查时的祭司位置
@@ -195,6 +198,7 @@ private:
     void demand_build();         // 建造需求（房屋 / 冲铜器链 / 学院 / 农田 / 箭塔）
     void demand_dropoff();       // 资源点太远时，就近补建谷仓/仓库
     double nearest_dropoff_dist(int resType, double dr, double ur);  // 最近的存放建筑距离
+    bool hunt_dropoff_ready();   // 打猎前置：瞪羚附近是否已有可用存放建筑
     bool block_is_standable(int i, int j);   // 单格是否可站立（排除水/斜坡/水边/建筑/资源）
     void demand_produce();       // 生产需求（村民）
     void demand_gather();        // 采集需求（食物 / 木 / 石 / 金 / 打猎 / 农田）
