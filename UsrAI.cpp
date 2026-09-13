@@ -61,6 +61,47 @@ static const double SCOUT_BACK_PENALTY = 1.2;
 static const int SCOUT_EDGE_MARGIN = 10;
 static const double SCOUT_EDGE_PENALTY = 1.5;
 
+// 新探路（以营地为圆心的环形广度优先）参数：
+//   从营地外 SCOUT_RING_START 格开始，每圈按弧长均匀布点
+//   （间距 ≈SCOUT_ARC_SPACING），一圈扫完半径 +SCOUT_RING_STEP。
+//   STEP 调小 → 扫得更细（更慢）；调大 → 更粗更快。
+static const int SCOUT_RING_START = 10;
+static const int SCOUT_RING_STEP = 8;
+
+// 每圈路点的目标间距（弧长，格）。点上个数按弧长算：n = 2πr / 间距。
+// 必须按弧长算——营地几乎总在地图角落，"以营地为圆心的整圆"有大半在图外；
+// 若每圈固定取 16 个点，图内那段弧上只剩 3~4 个点、间距二十多格，
+// 看起来就成了"沿直线往外扩、只扫 1/4 圈"。
+static const int SCOUT_ARC_SPACING = 8;
+
+// 让箭塔先拉仇恨、再让祭司转化：塔开火后等这么久（毫秒）祭司才动手。
+static const int CONVERT_AGGRO_DELAY = 1500;
+
+// 敌方打到家时，祭司离防御锚点（箭塔/市中心）超过这个距离才把它叫回来
+// （块）。已经在附近就交给 combat_tactic 专心转化，不再移动。
+static const int SCOUT_HOME_CALL_RADIUS = 15;
+
+// 祭司靠到防御锚点（箭塔/市中心）这个距离以内就算"已到位"，不再下移动指令。
+// 不能用"距落脚点 <4 格"判定：塔边常挤满村民，祭司到不了那个精确格子，
+// 会反复换点、在塔边来回徘徊。
+static const int HOME_STAY_RADIUS = 6;
+
+// 采集/捕猎点到"最近的可用存放建筑"超过这个距离（块），就就近补建谷仓/仓库，
+// 减少村民来回跑路的时间。
+static const int DROP_DIST_MAX = 25;
+
+// 冲铜器阶段（还没进铜器）的采集比例：食物优先，木/石只保留较低需求。
+// 数值为"占村民总数的百分比"；升级铜器要 800 食物，所以食物拿大头。
+// 当前档位：食物 ≈65%、木头 ≈25%、石头 ≈10%。
+// 若发现建筑链因木头不够而卡住，把 PRE_BRONZE_WOOD_PCT 调大即可。
+static const int PRE_BRONZE_STONE_PCT = 10;
+static const int PRE_BRONZE_WOOD_PCT  = 28;
+
+// 箭塔数量目标：前期 1 座就够挡第一波，多建是浪费石头（150 石/座）；
+// 进铜器后再补到 2 座。
+static const int TOWER_TARGET_EARLY  = 1;
+static const int TOWER_TARGET_BRONZE = 2;
+
 void UsrAI::processData()
 {
     info = getInfo();
@@ -158,8 +199,8 @@ void UsrAI::bt_sync()
         phase = 2;   // 铜器时代：发展军事、防守三波
     }
 
-    // 进入第二阶段后加强防御工事（箭塔目标数 2 → 4）
-    if (phase == 2) arrowTowerTarget = 4;
+    // 箭塔数量目标：前期 1 座即可，进铜器后再补
+    arrowTowerTarget = (phase >= 2) ? TOWER_TARGET_BRONZE : TOWER_TARGET_EARLY;
 
     recycle_tasks();
 }
@@ -225,16 +266,21 @@ bool UsrAI::center_free()
 // ---------- 建造需求 ----------
 void UsrAI::demand_build()
 {
-    // ---- 补房屋（人口快满时，提前预留 6 人空间，且最多同时建 2 座）----
-    if (info.Human_MaxNum - info.Human_Num <= 6
-        && info.Wood >= BUILD_HOUSE_WOOD + 30
-        && active_build(BUILDING_HOME) < 2) {
-        Task t;
-        t.id = nextTaskId++;
-        t.type = TASK_BUILD;
-        t.priority = 1;
-        t.buildingType = BUILDING_HOME;
-        taskQueue.push_back(t);
+    // ---- 房屋：按"目标人口"提前补，别让人口上限卡住村民生产与造兵 ----
+    {
+        int targetPop = 20 + armyTarget + 4;   // 村民上限 + 军队目标 + 余量
+        int homeNeed = (targetPop - info.Human_MaxNum + HOUSE_HUMAN_NUM - 1)
+                       / HOUSE_HUMAN_NUM;      // 还差几座房
+        if (homeNeed > 0
+            && info.Wood >= BUILD_HOUSE_WOOD
+            && active_build(BUILDING_HOME) < 2) {
+            Task t;
+            t.id = nextTaskId++;
+            t.type = TASK_BUILD;
+            t.priority = 1;
+            t.buildingType = BUILDING_HOME;
+            taskQueue.push_back(t);
+        }
     }
 
     // ---- 冲铜器建筑链：谷仓 → 市场 → 兵营 → 靶场 → 马厩 ----
@@ -338,6 +384,86 @@ void UsrAI::demand_build()
         }
     }
 
+    // ---- 资源点太远 → 就近补建谷仓/仓库 ----
+    demand_dropoff();
+}
+
+// ---------- 就近补建存放建筑（谷仓 / 仓库）----------
+// 村民采满一组后会去最新的存放建筑上交，太远会大量浪费时间在路上。
+// 存放规则：浆果食物 → 谷仓；木/石/金/狩猎食物 → 仓库；市中心什么都能存。
+// 若某资源点到"最近的可用存放建筑"超过 DROP_DIST_MAX 格，就在该资源点旁补建。
+void UsrAI::demand_dropoff()
+{
+    // 限流：谷仓、仓库各最多 2 座（含正在建的）
+    int granaryCnt = count_done(BUILDING_GRANARY) + active_build(BUILDING_GRANARY);
+    int stockCnt   = count_done(BUILDING_STOCK)   + active_build(BUILDING_STOCK);
+
+    struct Need { int resType; int btype; };
+    const Need needs[] = {
+        { RESOURCE_BUSH,     BUILDING_GRANARY },
+        { RESOURCE_TREE,     BUILDING_STOCK   },
+        { RESOURCE_STONE,    BUILDING_STOCK   },
+        { RESOURCE_GOLD,     BUILDING_STOCK   },
+        { RESOURCE_GAZELLE,  BUILDING_STOCK   },
+        { RESOURCE_ELEPHANT, BUILDING_STOCK   },
+    };
+
+    for (const Need &n : needs) {
+        if (n.btype == BUILDING_GRANARY && granaryCnt >= 2) continue;
+        if (n.btype == BUILDING_STOCK   && stockCnt   >= 2) continue;
+
+        int wood = (n.btype == BUILDING_GRANARY) ? BUILD_GRANARY_WOOD : BUILD_STOCK_WOOD;
+        if (info.Wood < wood) continue;
+
+        // 已有同类任务在排队就不重复加
+        bool queued = false;
+        for (Task &t : taskQueue)
+            if (t.type == TASK_BUILD && t.buildingType == n.btype
+                && t.resourceType == n.resType) { queued = true; break; }
+        if (queued) continue;
+
+        // 找该类型中"离存放建筑最远"的资源点，作为新建的锚点
+        int bestSN = -1;
+        double worst = DROP_DIST_MAX * BLOCKSIDELENGTH;
+        for (tagResource &r : info.resources) {
+            if (r.Type != n.resType) continue;
+            if (r.Cnt <= 0 && r.Blood <= 0) continue;
+            double d = nearest_dropoff_dist(n.resType, r.DR, r.UR);
+            if (d > worst) { worst = d; bestSN = r.SN; }
+        }
+        if (bestSN == -1) continue;
+
+        Task t;
+        t.id = nextTaskId++;
+        t.type = TASK_BUILD;
+        t.priority = 2;
+        t.buildingType = n.btype;
+        t.resourceType = n.resType;   // 标记：这是"选址在资源旁的存放建筑"
+        t.targetSN = bestSN;          // 锚点资源 SN
+        taskQueue.push_back(t);
+
+        if (n.btype == BUILDING_GRANARY) granaryCnt++;
+        else stockCnt++;
+    }
+}
+
+// 资源点 (dr,ur) 到"最近的可用存放建筑"的距离。
+double UsrAI::nearest_dropoff_dist(int resType, double dr, double ur)
+{
+    bool berryFood = (resType == RESOURCE_BUSH);
+    double best = 1e18;
+    for (tagBuilding &b : info.buildings) {
+        if (b.Percent < 100) continue;
+        bool can = (b.Type == BUILDING_CENTER)
+                || (berryFood && b.Type == BUILDING_GRANARY)
+                || (!berryFood && b.Type == BUILDING_STOCK);
+        if (!can) continue;
+        double d = calDistance(dr, ur,
+                               b.BlockDR * BLOCKSIDELENGTH,
+                               b.BlockUR * BLOCKSIDELENGTH);
+        if (d < best) best = d;
+    }
+    return best;
 }
 
 // ---------- 生产需求：村民 ----------
@@ -373,24 +499,36 @@ void UsrAI::demand_gather()
     // ---- 采集需求（食物 / 木头 / 石头 / 黄金按需分配）----
     int total = farmerNum > 0 ? farmerNum : 1;
 
-    // 箭塔未建够且石头不足时，分配村民采石（约 1/6，至少 1 人）
+    // 冲铜器阶段（未进铜器）：食物优先，木/石只保留较低需求
+    bool preBronze = (phase < 2);
+
+    // 箭塔未建够且石头不足时才安排采石
     int towerCnt = 0;
     for (tagBuilding &b : info.buildings)
         if (b.Type == BUILDING_ARROWTOWER) towerCnt++;
     bool needStone = (towerCnt < arrowTowerTarget) && (info.Stone < BUILD_ARROWTOWER_STONE);
 
-    int wantStone = needStone ? (total / 6) : 0;
-    if (wantStone < 1 && needStone) wantStone = 1;
+    int wantStone = 0;
+    if (needStone) {
+        wantStone = preBronze ? (total * PRE_BRONZE_STONE_PCT / 100)
+                              : (total / 6);
+        if (wantStone < 1) wantStone = 1;
+    }
 
-    // 进入第二阶段后需要黄金（骑兵 / 方阵兵 / 科技），安排约 1/8 的人采金
+    // 黄金：进铜器后（骑兵 / 方阵兵 / 科技要用）才安排，冲铜器阶段不采
     int wantGold = 0;
-    if (phase >= 2 && has_resource(RESOURCE_GOLD)) {
+    if (!preBronze && has_resource(RESOURCE_GOLD)) {
         wantGold = total / 8;
         if (wantGold < 1) wantGold = 1;
     }
 
     int rest = total - wantStone - wantGold; if (rest < 1) rest = 1;
-    int wantWood = rest * 4 / 10; if (wantWood < 1) wantWood = 1;
+    int wantWood;
+    if (preBronze)
+        wantWood = rest * PRE_BRONZE_WOOD_PCT / 100;   // 冲铜器：木只留较低比例
+    else
+        wantWood = rest * 4 / 10;
+    if (wantWood < 1) wantWood = 1;
     int wantFood = rest - wantWood;   // 食物拿大头 + 取整余数
 
     // 浆果丛有限：先分配村民采浆果，多余的村民去打猎（瞪羚），最后用农田补足
@@ -771,8 +909,6 @@ bool UsrAI::block_is_water_side(int x, int y)
 }
 
 // 以 (cx,cy) 为圆心、半径 [r0,r1] 的环形范围内，找一个可站立的空块。
-// 排除：水域/斜坡/水域边上一格、已被规划的建筑占位、已有建筑与静态资源占用。
-// 不排除移动单位（它们会走开）。
 bool UsrAI::find_free_spot_near(int cx, int cy, int r0, int r1, int &bx, int &by)
 {
     if (info.theMap == nullptr) return false;
@@ -789,24 +925,7 @@ bool UsrAI::find_free_spot_near(int cx, int cy, int r0, int r1, int &bx, int &by
                 int di = (i > cx) ? (i - cx) : (cx - i);
                 int dj = (j > cy) ? (j - cy) : (cy - j);
                 if (di != r && dj != r) continue;          // 只扫本圈环上的点
-                if (i < 1 || j < 1 || i >= w - 1 || j >= h - 1) continue;
-
-                int type = (*info.theMap)[i][j].type;
-                if (type != MAPPATTERN_GRASS && type != MAPPATTERN_DESERT
-                    && type != MAPPATTERN_SHOAL) continue;
-                if (block_is_water_side(i, j)) continue;   // 水边/斜坡不站
-                if (MAP[i][j] != 0) continue;              // 已被规划的建筑占位
-
-                bool blocked = false;
-                for (tagBuilding &b : info.buildings) {
-                    int bs = building_size(b.Type);
-                    if (i >= b.BlockDR && i < b.BlockDR + bs &&
-                        j >= b.BlockUR && j < b.BlockUR + bs) { blocked = true; break; }
-                }
-                if (!blocked)
-                    for (tagResource &r2 : info.resources)
-                        if (r2.BlockDR == i && r2.BlockUR == j) { blocked = true; break; }
-                if (blocked) continue;
+                if (!block_is_standable(i, j)) continue;
 
                 bx = i;
                 by = j;
@@ -817,22 +936,118 @@ bool UsrAI::find_free_spot_near(int cx, int cy, int r0, int r1, int &bx, int &by
     return false;
 }
 
-// 在市中心附近找一个可站立空块作为落脚点。
-// attempt 越大搜索半径越向外扩，用于卡住后换点重试。
-bool UsrAI::find_home_spot(int &bx, int &by, int attempt)
+// 单格是否可站立：排除水域/斜坡/水域边上一格、已被规划的建筑占位、
+// 已有建筑与静态资源占用。不排除移动单位（它们会走开）。
+bool UsrAI::block_is_standable(int i, int j)
 {
+    if (info.theMap == nullptr) return false;
+    int w = (int)info.theMap->size();
+    if (w <= 0) return false;
+    int h = (int)(*info.theMap)[0].size();
+    if (w > 505) w = 505;
+    if (h > 505) h = 505;
+    if (i < 1 || j < 1 || i >= w - 1 || j >= h - 1) return false;
+
+    int type = (*info.theMap)[i][j].type;
+    if (type != MAPPATTERN_GRASS && type != MAPPATTERN_DESERT
+        && type != MAPPATTERN_SHOAL) return false;
+    if (block_is_water_side(i, j)) return false;   // 水边/斜坡不站
+    if (MAP[i][j] != 0) return false;              // 已被规划的建筑占位
+
+    for (tagBuilding &b : info.buildings) {
+        int bs = building_size(b.Type);
+        if (i >= b.BlockDR && i < b.BlockDR + bs &&
+            j >= b.BlockUR && j < b.BlockUR + bs) return false;
+    }
+    for (tagResource &r : info.resources)
+        if (r.BlockDR == i && r.BlockUR == j) return false;
+
+    return true;
+}
+
+// 取下一个待访问的环上路点（环形广度优先）。
+// 环半径从 SCOUT_RING_START 开始，每圈按弧长均匀布点（间距 ≈SCOUT_ARC_SPACING），
+// 一圈扫完（或剩下的点在图外/不可站立）则半径 +SCOUT_RING_STEP。
+bool UsrAI::next_ring_point(int &bx, int &by)
+{
+    if (info.theMap == nullptr) return false;
+    int w = (int)info.theMap->size();
+    if (w <= 0) return false;
+    int h = (int)(*info.theMap)[0].size();
+    if (w > 505) w = 505;
+    if (h > 505) h = 505;
+
     int cx = -1, cy = -1;
     for (tagBuilding &b : info.buildings) {
         if (b.Type == BUILDING_CENTER) {
-            cx = b.BlockDR + 1;   // 中心建筑的几何中心格
+            cx = b.BlockDR + 1;   // 营地中心格
             cy = b.BlockUR + 1;
             break;
         }
     }
     if (cx < 0) return false;
 
-    int r0 = 3 + attempt * 4;        // 起始半径：先在家门口找
-    return find_free_spot_near(cx, cy, r0, r0 + 4, bx, by);
+    const double TWO_PI = 6.283185307179586;
+    int maxRing = w + h;                 // 足够大：扫到最远边界
+    if (ringRadius == 0) ringRadius = SCOUT_RING_START;
+
+    for (int guard = 0; guard < 8192; guard++) {
+        if (ringRadius > maxRing) return false;      // 全部扫完
+
+        int k = ringIndex++;
+
+        // 本圈采样点数按弧长算：保证相邻路点间距 ≈SCOUT_ARC_SPACING 格。
+        int nPts = (int)lround(TWO_PI * ringRadius / (double)SCOUT_ARC_SPACING);
+        if (nPts < 6) nPts = 6;
+        if (k >= nPts) { ringIndex = 0; ringRadius += SCOUT_RING_STEP; continue; }
+
+        // 每圈起点错开一点角度，避免每圈都从同一方向开始、留下放射状空隙
+        double ang = TWO_PI * (k / (double)nPts)
+                     + (ringRadius / (double)SCOUT_RING_STEP) * 0.4;
+        int i = cx + (int)lround(ringRadius * cos(ang));
+        int j = cy + (int)lround(ringRadius * sin(ang));
+
+        if (i < 1 || j < 1 || i >= w - 1 || j >= h - 1) continue;  // 图外
+        if (scoutSeen[i][j]) continue;                             // 去过
+        if (!block_is_standable(i, j)) continue;                   // 不可站立
+
+        scoutSeen[i][j] = 1;
+        bx = i;
+        by = j;
+        return true;
+    }
+    return false;
+}
+
+// 取"防御锚点"块坐标：优先己方已建成的箭塔（祭司躲到塔下才有掩护），
+// 没有箭塔时退回市镇中心。找不到返回 false。
+bool UsrAI::get_defense_anchor(int &cx, int &cy)
+{
+    for (tagBuilding &b : info.buildings) {
+        if (b.Type != BUILDING_ARROWTOWER || b.Percent < 100) continue;
+        cx = b.BlockDR;
+        cy = b.BlockUR;
+        return true;
+    }
+    for (tagBuilding &b : info.buildings) {
+        if (b.Type != BUILDING_CENTER) continue;
+        cx = b.BlockDR + 1;   // 中心建筑几何中心格
+        cy = b.BlockUR + 1;
+        return true;
+    }
+    return false;
+}
+
+// 在"防御锚点"附近找一个可站立空块作为落脚点。
+// 锚点优先取己方**箭塔**：祭司躲到塔下，敌兵打它时会被箭塔射击，才有人掩护；
+// 没有箭塔时退回市镇中心。attempt 越大搜索半径越向外扩，用于卡住后换点重试。
+bool UsrAI::find_home_spot(int &bx, int &by, int attempt)
+{
+    int cx = -1, cy = -1;
+    if (!get_defense_anchor(cx, cy)) return false;
+
+    int r0 = 2 + attempt * 3;        // 先在锚点紧邻处找，卡住再向外扩
+    return find_free_spot_near(cx, cy, r0, r0 + 3, bx, by);
 }
 
 // 探图途中遇到敌人的处置：**不是回村**，而是朝"背离附近所有敌人"的方向撤离，
@@ -886,8 +1101,8 @@ void UsrAI::scout_retreat(tagArmy *priest)
     HumanMove(priest->SN, gx, gy);
 }
 
-// 派祭司回村。要点：
-//   1) 目的地取"市中心附近的可站立空块"，而不是市中心自己占的块
+// 派祭司回村（躲到箭塔下）。要点：
+//   1) 目的地取"箭塔（没有塔则市中心）附近的可站立空块"，而不是建筑自己占的块
 //      （后者是建筑，必然不可达，单位会贴到旁边卡住）；
 //   2) 每 2 秒最多重下一次指令，避免每帧刷同一道命令；
 //   3) 1 秒内没有位移（卡住）就换个更靠外的落脚点；多次都回不去则放弃下令，
@@ -899,6 +1114,21 @@ void UsrAI::recall_priest_home(tagArmy *priest)
     // 回村会改变行进方向，清掉探索方向，避免恢复探图后把"该去的方向"误判为回头
     scoutHeadDR = 0;
     scoutHeadUR = 0;
+
+    // 已经守在防御锚点（箭塔/市中心）旁边：不再下任何指令，
+    // 否则会在塔边反复换落脚点、来回徘徊。
+    {
+        int ax = -1, ay = -1;
+        if (get_defense_anchor(ax, ay)
+            && calDistance(priest->DR, priest->UR,
+                           ax * BLOCKSIDELENGTH, ay * BLOCKSIDELENGTH)
+               <= HOME_STAY_RADIUS * BLOCKSIDELENGTH) {
+            homeSpotX = -1;
+            homeSpotY = -1;
+            homeSpotTry = 0;
+            return;
+        }
+    }
 
     // 卡住检测（与探图共用采样变量）
     int interval = 1000 / TimePerFrame;
@@ -950,8 +1180,114 @@ void UsrAI::recall_priest_home(tagArmy *priest)
     HumanMove(priest->SN, tx, ty);
 }
 
-// ---------- 探路：祭司探索未探索区域（带防护与限时回村）----------
+// ---------- 探路：祭司以营地为圆心做环形广度优先搜索 ----------
+// 一圈一圈向外扫：环半径从 SCOUT_RING_START 开始，每圈按弧长均匀布点（间距约 8 格），
+// 等角度路点，逐个走过去；一圈扫完半径 +SCOUT_RING_STEP。
+// 好处：不会一条线扎得很远，也不会走回头路；扫完所有环后回村。
+// 回村时间与旧逻辑一致（3.5 分钟）。
 void UsrAI::demand_scout()
+{
+    // 已发现敌方武器工程厂后，第三阶段祭司随军行动，不再单独探图
+    if (phase >= 3 && enemySiegeSN != -1) return;
+
+    // 反攻阶段若仍未找到敌方基地，则必须继续探索（否则无法取胜）
+    bool mustFindBase = (phase >= 3);
+
+    // 探路者 = 祭司
+    tagArmy *priest = nullptr;
+    for (tagArmy &a : info.armies)
+        if (a.Sort == AT_PRIEST) { priest = &a; break; }
+    if (priest == nullptr) return;   // 祭司不在（死亡即游戏结束）
+
+    // 敌方武器工程厂是胜利目标（转化它即获胜），探图时持续记录其位置
+    for (tagBuilding &eb : info.enemy_buildings) {
+        if (eb.Type == BUILDING_SIEGE) {
+            enemySiegeSN = eb.SN;
+            enemySiegeDR = eb.BlockDR * BLOCKSIDELENGTH;
+            enemySiegeUR = eb.BlockUR * BLOCKSIDELENGTH;
+        }
+    }
+
+    // ---- 敌方正在打我方的家：祭司交给 combat_tactic（箭塔拉仇恨 + 转化）----
+    // 这一段必须放在"时间到回村"之前，否则回村指令会把同一帧刚下的转化指令覆盖掉。
+    // 只有祭司还在外面很远时才叫它回村，已经在塔/中心附近就让它专心转化。
+    if (bt_enemy_at_home()) {
+        int ax = -1, ay = -1;
+        if (get_defense_anchor(ax, ay)
+            && calDistance(priest->DR, priest->UR,
+                           ax * BLOCKSIDELENGTH, ay * BLOCKSIDELENGTH)
+               > SCOUT_HOME_CALL_RADIUS * BLOCKSIDELENGTH) {
+            recall_priest_home(priest);
+        }
+        return;
+    }
+
+    // ---- 时间到：探图结束，回村待命（躲到箭塔下）----
+    int returnFrame = (int)(3.5 * 60 * 1000.0 / TimePerFrame);
+    bool timeUp = (info.GameFrame > returnFrame);
+    if (timeUp && !mustFindBase) {
+        recall_priest_home(priest);
+        return;
+    }
+
+    // ---- 探图途中遇到敌人：记录位置 + 朝背离方向撤离（不回村）----
+    // 祭司在家里时不撤：交给 combat_tactic 的「箭塔拉仇恨 + 祭司转化」
+    record_enemy_spots();
+    bool atHome = false;
+    for (tagBuilding &b : info.buildings) {
+        if (b.Type == BUILDING_CENTER && b.Percent >= 100) {
+            atHome = (calDistance(priest->DR, priest->UR,
+                                  b.BlockDR * BLOCKSIDELENGTH,
+                                  b.BlockUR * BLOCKSIDELENGTH)
+                      < HOME_DEFEND_RADIUS * BLOCKSIDELENGTH);
+            break;
+        }
+    }
+    if (!atHome
+        && enemy_near(priest->DR, priest->UR, SCOUT_THREAT_RADIUS * BLOCKSIDELENGTH)) {
+        scout_retreat(priest);
+        return;
+    }
+
+    // 卡住检测：1 秒内位移不足 1 格 → 该路点不可达，跳到下一个
+    bool stuck = false;
+    int interval = 1000 / TimePerFrame;
+    if (interval < 1) interval = 1;
+    if (scoutCheckFrame == 0) {
+        scoutCheckFrame = info.GameFrame;
+        scoutCheckDR = priest->DR;
+        scoutCheckUR = priest->UR;
+    } else if (info.GameFrame - scoutCheckFrame >= interval) {
+        double mDR = priest->DR - scoutCheckDR; if (mDR < 0) mDR = -mDR;
+        double mUR = priest->UR - scoutCheckUR; if (mUR < 0) mUR = -mUR;
+        if (mDR < 1.0 && mUR < 1.0) stuck = true;
+        scoutCheckFrame = info.GameFrame;
+        scoutCheckDR = priest->DR;
+        scoutCheckUR = priest->UR;
+    }
+
+    // 走到路点（空闲）或被卡住时才取下一个路点
+    if (priest->NowState != HUMAN_STATE_IDLE && !stuck) return;
+
+    // 取点节流：刚下过指令、单位可能还没进入行走状态时不重复取点
+    if (!stuck) {
+        int gap = 300 / TimePerFrame;
+        if (gap < 1) gap = 1;
+        if (priestOrderFrame != 0 && info.GameFrame - priestOrderFrame < gap) return;
+    }
+
+    int tx = -1, ty = -1;
+    if (!next_ring_point(tx, ty)) {
+        recall_priest_home(priest);   // 所有环都扫完了：回村待命
+        return;
+    }
+
+    priestOrderFrame = info.GameFrame;
+    HumanMove(priest->SN, (tx + 0.5) * BLOCKSIDELENGTH, (ty + 0.5) * BLOCKSIDELENGTH);
+}
+
+// ---------- 【旧逻辑，保留但不使用】前沿点 + 步长选点 ----------
+void UsrAI::demand_scout_frontier()
 {
     // 已发现敌方武器工程厂后，第三阶段祭司随军行动，不再单独探图
     if (phase >= 3 && enemySiegeSN != -1) return;
@@ -1241,11 +1577,22 @@ void UsrAI::assign_tasks()
 
             int size = building_size(t.buildingType);
 
-            // 锚点：房屋优先挨着已有房屋（聚成居住区），其他建筑以市镇中心为中心
+            // 锚点优先级：
+            //   房屋 → 挨着已有房屋（聚成居住区）
+            //   资源旁的谷仓/仓库（resourceType/targetSN 有值）→ 挨着目标资源点
+            //   其余 → 以市镇中心为中心
             int ax = -1, ay = -1;
             if (t.buildingType == BUILDING_HOME) {
                 for (tagBuilding &b : info.buildings) {
                     if (b.Type == BUILDING_HOME) { ax = b.BlockDR; ay = b.BlockUR; break; }
+                }
+            }
+            if (ax == -1 && t.resourceType != -1 && t.targetSN != -1) {
+                for (tagResource &r : info.resources) {
+                    if (r.SN != t.targetSN) continue;
+                    ax = r.BlockDR;
+                    ay = r.BlockUR;
+                    break;
                 }
             }
             if (ax == -1) {
@@ -1256,8 +1603,10 @@ void UsrAI::assign_tasks()
             if (ax == -1) continue;   // 无锚点（异常）
 
             int x = -1, y = -1;
-            // 以锚点为中心，半径 4 一圈一圈向外扩（环形搜索）
-            for (int r = 4; r <= 48 && x == -1; r += 4) {
+            // 以锚点为中心一圈一圈向外扩（环形搜索）；
+            // 资源旁的存放建筑从 2 格起找，尽快贴着资源建
+            int startR = (t.resourceType != -1) ? 2 : 4;
+            for (int r = startR; r <= 48 && x == -1; r += 4) {
                 for (int i = -r; i <= r && x == -1; i++) {
                     for (int j = -r; j <= r && x == -1; j++) {
                         int di = i < 0 ? -i : i;
@@ -1398,28 +1747,83 @@ void UsrAI::combat_tactic()
         return false;
     };
 
-    // ---- 1) 箭塔集火：锁定一个目标，除非它消失/死亡，否则不切换 ----
+    // ---- 1) 箭塔集火 ----
+    // 目标优先级：
+    //   a) 正在攻击祭司的敌人（必须优先拉走，否则弓箭手这类远程会站着白嫖祭司）
+    //   b) 离市镇中心最近的敌人
+    // 关键：不能"锁定后就不换"——只要有新的敌人开始打祭司，就要切过去拉仇恨。
     bool focusAlive = false;
     for (int sn : enemies)
         if (sn == towerFocusSN) { focusAlive = true; break; }
 
-    if (!focusAlive) {
-        // 重新选：优先挑正在攻击祭司的敌人，否则取第一个
-        towerFocusSN = enemies[0];
-        for (int sn : enemies) {
-            if (attackingPriest(sn)) { towerFocusSN = sn; break; }
+    int priestAttacker = -1;
+    for (int sn : enemies)
+        if (attackingPriest(sn)) { priestAttacker = sn; break; }
+
+    // 当前目标已经咬着祭司 → 保持不变（不要反复横跳）
+    bool focusOnPriest = (towerFocusSN != -1 && attackingPriest(towerFocusSN));
+
+    if (priestAttacker != -1 && priestAttacker != towerFocusSN && !focusOnPriest) {
+        towerFocusSN = priestAttacker;          // 切到正在打祭司的敌人
+    } else if (!focusAlive) {
+        // 目标没了：优先挑离市镇中心最近的敌人
+        // （enemy_armies 每帧被打乱，按下标取可能锁到很远的敌人，导致箭塔打空）
+        double cx = -1, cy = -1;
+        for (tagBuilding &b : info.buildings) {
+            if (b.Type == BUILDING_CENTER) {
+                cx = b.BlockDR * BLOCKSIDELENGTH;
+                cy = b.BlockUR * BLOCKSIDELENGTH;
+                break;
+            }
+        }
+        towerFocusSN = -1;
+        double best = 1e18;
+        for (tagArmy &e : info.enemy_armies) {
+            double d = (cx < 0) ? 0.0 : calDistance(cx, cy, e.DR, e.UR);
+            if (d < best) { best = d; towerFocusSN = e.SN; }
+        }
+        for (tagFarmer &e : info.enemy_farmers) {
+            double d = (cx < 0) ? 0.0 : calDistance(cx, cy, e.DR, e.UR);
+            if (d < best) { best = d; towerFocusSN = e.SN; }
+        }
+        if (towerFocusSN == -1) towerFocusSN = enemies[0];   // 兜底
+    }
+
+    // 所有箭塔集中攻击同一个目标（该目标即"已被吸引仇恨"的标记）。
+    // 关键：只在"集火目标变了"或"每 2 秒刷新一次"时才下令。
+    // 每帧重复下令会让箭塔不断重新索敌、永远打不出伤害（频繁索敌 bug）。
+    {
+        int refresh = 2000 / TimePerFrame;
+        if (refresh < 1) refresh = 1;
+        bool needOrder = (towerFocusSN != lastTowerFocusSN)
+                      || (info.GameFrame - towerOrderFrame >= refresh);
+        if (needOrder) {
+            if (towerFocusSN != lastTowerFocusSN)
+                towerAggroFrame = info.GameFrame;   // 换了新集火目标：重新计拉仇恨时间
+            lastTowerFocusSN = towerFocusSN;
+            towerOrderFrame = info.GameFrame;
+            for (tagBuilding &tower : info.buildings) {
+                if (tower.Type != BUILDING_ARROWTOWER) continue;
+                if (tower.Percent < 100) continue;
+                towerTargetSN[tower.SN] = towerFocusSN;
+                HumanAction(tower.SN, towerFocusSN);
+            }
         }
     }
 
-    // 所有箭塔集中攻击同一个目标（该目标即"已被吸引仇恨"的标记）
-    for (tagBuilding &tower : info.buildings) {
-        if (tower.Type != BUILDING_ARROWTOWER) continue;
-        if (tower.Percent < 100) continue;
-        HumanAction(tower.SN, towerFocusSN);
-    }
+    // ---- 2) 祭司转化：必须等箭塔先拉到仇恨 ----
+    // 敌人被打后会优先转火箭塔（"攻击自己的第一个对象"优先级最高），
+    // 所以先让箭塔开火一段时间，祭司再上去转化，否则仇恨会直接招到祭司身上。
+    bool hasTower = false;
+    for (tagBuilding &b : info.buildings)
+        if (b.Type == BUILDING_ARROWTOWER && b.Percent >= 100) { hasTower = true; break; }
 
-    // ---- 2) 祭司转化"其他"敌人 ----
-    // 仅当祭司位于村庄附近时才转化；外出探图期间只躲避、不下战斗指令
+    int aggroDelay = CONVERT_AGGRO_DELAY / TimePerFrame;
+    if (aggroDelay < 1) aggroDelay = 1;
+    bool aggroReady = !hasTower
+                   || (towerAggroFrame != 0
+                       && info.GameFrame - towerAggroFrame >= aggroDelay);
+
     bool priestAtHome = false;
     for (tagBuilding &b : info.buildings) {
         if (b.Type == BUILDING_CENTER && b.Percent >= 100) {
@@ -1431,8 +1835,8 @@ void UsrAI::combat_tactic()
         }
     }
 
-    if (priest != nullptr && priest->ConvertCooldown == 0 && priestAtHome) {
-        // 清理：上次转化目标已不在敌方列表（转化成功或死亡）
+    if (priest != nullptr && priest->ConvertCooldown == 0 && priestAtHome && aggroReady) {
+        // 目标失效（转化成功/死亡/离开视野）→ 重新选
         if (convertTargetSN != -1) {
             bool stillEnemy = false;
             for (int sn : enemies)
@@ -1440,16 +1844,41 @@ void UsrAI::combat_tactic()
             if (!stillEnemy) convertTargetSN = -1;
         }
 
-        if (convertTargetSN == -1) {
-            // 优先级：正在攻击祭司且非集火目标 → 任意非集火目标 → 只剩集火目标
-            int target = -1;
-            for (int sn : enemies)
-                if (sn != towerFocusSN && attackingPriest(sn)) { target = sn; break; }
-            if (target == -1)
-                for (int sn : enemies)
-                    if (sn != towerFocusSN) { target = sn; break; }
-            if (target == -1) target = towerFocusSN;
+        // 选目标优先级：
+        //   1) 正在攻击祭司的（自卫）
+        //   2) 非箭塔集火目标中离祭司最近的（别把塔正在拉仇恨的那个抢走）
+        //   3) 只剩集火目标时，就转化它
+        // 必须按距离选——enemy_armies 每帧会被打乱，按下标随便取会选到很远的
+        // 敌人，祭司就会跑去追它，第一波打到家门口也不转化。
+        int target = -1;
+        double best = 1e18;
+        for (tagArmy &e : info.enemy_armies) {
+            if (!attackingPriest(e.SN)) continue;
+            double d = calDistance(priest->DR, priest->UR, e.DR, e.UR);
+            if (d < best) { best = d; target = e.SN; }
+        }
+        if (target == -1) {
+            for (tagArmy &e : info.enemy_armies) {
+                if (e.SN == towerFocusSN) continue;   // 留给箭塔继续拉仇恨
+                double d = calDistance(priest->DR, priest->UR, e.DR, e.UR);
+                if (d < best) { best = d; target = e.SN; }
+            }
+            for (tagFarmer &e : info.enemy_farmers) {
+                if (e.SN == towerFocusSN) continue;
+                double d = calDistance(priest->DR, priest->UR, e.DR, e.UR);
+                if (d < best) { best = d; target = e.SN; }
+            }
+        }
+        if (target == -1) {
+            for (tagArmy &e : info.enemy_armies)
+                if (e.SN == towerFocusSN) { target = e.SN; break; }
+        }
 
+        // 目标变了、或祭司空闲（上一条指令已完成）时才重新下令；
+        // 否则不要每帧重下，免得打断正在进行的转化
+        if (target != -1
+            && (target != convertTargetSN
+                || priest->NowState == HUMAN_STATE_IDLE)) {
             convertTargetSN = target;
             HumanAction(priest->SN, target);
         }
