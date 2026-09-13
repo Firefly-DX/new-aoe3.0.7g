@@ -56,19 +56,78 @@ private:
 
     std::vector<Task> taskQueue;
     int nextTaskId = 0;
-    int phase = 0;                // 阶段状态机：0开局 1冲铜器 2军事航海 3决胜
+    int phase = 0;                // 阶段状态机：1冲铜器 2发展军事 3反攻
 
-    void produce_demands();
     void sort_tasks();
     void assign_tasks();
     void recycle_tasks();
 
     // 战斗模块：箭塔拉仇恨 + 祭司转化防御
+    // 注意：只有当敌方逼近我方城市（enemy_at_home）时才启用，避免祭司探图途中被远处敌军误触发。
     void combat_tactic();
     int convertTargetSN = -1;        // 待转化的敌方单位 SN
-    int arrowTowerTarget = 2;        // 目标箭塔数量
+    int towerFocusSN = -1;           // 箭塔集火目标 SN（仇恨标记，锁定后不切换）
+    int scoutCheckFrame = 0;                     // 上次卡住检查的帧号
+    double scoutCheckDR = -1, scoutCheckUR = -1; // 上次卡住检查时的祭司位置
+
+    // ---- 回村 ----
+    // 回村目标不能取市镇中心自己占的块（那是建筑，必然不可达，会让祭司卡住），
+    // 必须另找一个可站立的空块作为落脚点。
+    int homeSpotX = -1, homeSpotY = -1;   // 回村落脚点块坐标
+    int homeSpotTry = 0;                  // 找落脚点的尝试次数（卡住时向外扩）
+    int priestOrderFrame = 0;             // 祭司移动指令上次下达帧（节流用）
+    void recall_priest_home(tagArmy *priest);            // 派祭司回村（带节流与卡住换点）
+    bool find_home_spot(int &bx, int &by, int attempt);  // 在市中心附近找可站立空块
+    void scout_retreat(tagArmy *priest);                 // 探图遇敌：朝背离敌人方向撤离
+    bool find_free_spot_near(int cx, int cy, int r0, int r1, int &bx, int &by);  // 找可站立空块
+
+    // ---- 探图时记录发现过的敌人位置 ----
+    // 祭司遇到敌人不回家，而是记录敌人所在地并换个方向继续探索；
+    // 回村只由时间条件决定（见 demand_scout 里的 timeUp）。
+    struct EnemySpot { double dr = 0; double ur = 0; int frame = 0; };
+    std::vector<EnemySpot> enemySpots;
+    void record_enemy_spots();                           // 记录当前可见敌人的位置（去重合并）
+    bool spot_near(double dr, double ur, double radius);  // 该点是否离已记录的敌点太近
+
+    // ---- 祭司探图（前沿点 + 可控步长）----
+    // 把"已探索陆地中紧邻未知区域的格子"当作前沿节点，每次选一个"未走过"的
+    // 前沿格前进；只标记"真正要去"的那一格。
+    // 注意：不能把目标周围一整片都标记成已访问——那样会在没实际走过的地方
+    // 留下大量空洞，只能探出一条窄走廊（广度不足）。
+    unsigned char scoutSeen[505][505] = {{0}};  // 已作为目标走过的前沿格
+    unsigned char scoutFront[505][505] = {{0}}; // 本次重算出的前沿格标记
+    double scoutHeadDR = 0, scoutHeadUR = 0;    // 当前探索方向（单位向量，用于惩罚走回头路）
+
+    // 水域及其相邻一格都视为"不可站立"：单位贴着水边寻路容易卡住
+    bool block_is_water_side(int x, int y);
+    int arrowTowerTarget = 2;        // 目标箭塔数量（进入第二阶段后提升）
     bool arrowTowerResearched = false;   // 箭塔科技是否已研发
     int arrowTowerResearchId = -1;   // 箭塔科技研发指令 id（-1 表示未在研）
+
+    // ==================== 第二阶段：军事（造兵 + 科技）====================
+    int armyTarget = 16;             // 目标军队规模（第三阶段自动提高）
+    void demand_army();              // 造兵需求
+    void demand_research();          // 科技研发需求
+
+    // 科技研发状态：同一个 Action 可用一次或两次（两级科技），用等级追踪
+    struct ResearchState {
+        int buildingType = -1;   // 执行建筑类型
+        int action = -1;         // BuildingAction 常量
+        int maxLevel = 1;        // 1 = 单级；2 = 两级
+        int level = 0;           // 已完成等级
+        int pendingId = -1;      // 在研指令 id（-1 表示未在研）
+        int food = 0, wood = 0, stone = 0, gold = 0;      // 一级资源门槛
+        int food2 = 0, wood2 = 0, stone2 = 0, gold2 = 0;  // 二级资源门槛
+        const char *name = "";
+    };
+    std::vector<ResearchState> researches;
+    void init_researches();
+    void request_research(ResearchState &r);
+
+    // ==================== 第三阶段：反攻（转化敌方武器工程厂取胜）====================
+    int enemySiegeSN = -1;                        // 敌方武器工程厂 SN
+    double enemySiegeDR = -1, enemySiegeUR = -1;  // 敌方武器工程厂细节坐标
+    void demand_attack();                         // 反攻需求
 
     // ==================== 行为树 ====================
 public:
@@ -120,10 +179,12 @@ private:
 
     // ---- 行为树叶子行为 ----
     void bt_sync();              // 阶段推进 + 回收任务
-    bool bt_has_enemy();         // 是否存在可见敌人
-    void demand_build();         // 建造需求（房屋/冲铜器链/箭塔）
-    void demand_produce();       // 生产需求（村民/兵）
-    void demand_gather();        // 采集需求（食物/木/石/打猎）
+    bool bt_enemy_at_home();     // 敌方是否已逼近我方城市（防御触发条件）
+    bool enemy_near(double dr, double ur, double radius);   // 指定点半径内是否有可见敌军
+    void demand_build();         // 建造需求（房屋 / 冲铜器链 / 学院 / 农田 / 箭塔）
+    void demand_produce();       // 生产需求（村民）
+    void demand_gather();        // 采集需求（食物 / 木 / 石 / 金 / 打猎 / 农田）
+    void demand_scout();         // 探路（祭司探索未探索区域）
     void bt_dispatch();          // 任务排序 + 派发
 
     // ---- 统计辅助 ----
@@ -134,29 +195,10 @@ private:
     bool has_resource(int rtype);
     bool center_free();
 
+    // 建造占位图：标记已规划/已建成的建筑位置（>0 = 占用），避免重复选址
     int MAP[505][505] = {{0}};
-    int len = 4;
 
-    unordered_map <int,int> farmer_task;
-    unordered_map <int,int> farmer_task_type;
-    unordered_map <int,int> farmer_resource;
-    unordered_map <int,int> resource_farmer;
-    unordered_map <int,int> farmer_building;
-    
-    int farmer_working_amount[4];
-    // 0 == food,1 == wood,2 == stone,3 == gold; 
-
-    void create_farmers();
-    void collecting_bush();
-    void collecting_tree();
     bool find_block(int x,int y,int dx,int dy);
-    void walk_to(tagHuman &a,double &dx,double &dy);
-    void collecting_resources();
-    void workers_count();
-    void check_and_clear();
-    void build_building(int b);
-
-    void run_timeline();
 
 };
 
