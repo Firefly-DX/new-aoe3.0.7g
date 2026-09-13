@@ -77,7 +77,8 @@ private:
     int homeSpotTry = 0;                  // 找落脚点的尝试次数（卡住时向外扩）
     int priestOrderFrame = 0;             // 祭司移动指令上次下达帧（节流用）
     void recall_priest_home(tagArmy *priest);            // 派祭司回村（带节流与卡住换点）
-    bool find_home_spot(int &bx, int &by, int attempt);  // 在市中心附近找可站立空块
+    bool find_home_spot(int &bx, int &by, int attempt);  // 在箭塔（或市中心）附近找可站立空块
+    bool get_defense_anchor(int &cx, int &cy);           // 防御锚点：优先己方箭塔，其次市镇中心
     void scout_retreat(tagArmy *priest);                 // 探图遇敌：朝背离敌人方向撤离
     bool find_free_spot_near(int cx, int cy, int r0, int r1, int &bx, int &by);  // 找可站立空块
 
@@ -98,11 +99,21 @@ private:
     unsigned char scoutFront[505][505] = {{0}}; // 本次重算出的前沿格标记
     double scoutHeadDR = 0, scoutHeadUR = 0;    // 当前探索方向（单位向量，用于惩罚走回头路）
 
+    // ---- 新探路：以营地为圆心的环形广度优先 ----
+    // 一圈一圈向外扫：每个环按角度均匀取路点，逐个走过去；一圈扫完则半径 +STEP。
+    int ringRadius = 0;                        // 当前正在搜索的环半径（块）
+    int ringIndex = 0;                         // 当前环上的路点下标
+    bool next_ring_point(int &bx, int &by);    // 取下一个待访问的环上路点
+
     // 水域及其相邻一格都视为"不可站立"：单位贴着水边寻路容易卡住
     bool block_is_water_side(int x, int y);
-    int arrowTowerTarget = 2;        // 目标箭塔数量（进入第二阶段后提升）
+    int arrowTowerTarget = 1;        // 目标箭塔数量（前期 1 座即可，进铜器后再补）
     bool arrowTowerResearched = false;   // 箭塔科技是否已研发
     int arrowTowerResearchId = -1;   // 箭塔科技研发指令 id（-1 表示未在研）
+    std::unordered_map<int,int> towerTargetSN;  // 箭塔 SN → 已下达的集火目标 SN（避免每帧重复索敌）
+    int towerOrderFrame = 0;                    // 上次对箭塔下令的帧号（周期性刷新用）
+    int lastTowerFocusSN = -1;                  // 上次下达的集火目标 SN
+    int towerAggroFrame = 0;                    // 当前集火目标"开始被箭塔打"的帧号（用于让塔先拉仇恨）
 
     // ==================== 第二阶段：军事（造兵 + 科技）====================
     int armyTarget = 16;             // 目标军队规模（第三阶段自动提高）
@@ -182,9 +193,13 @@ private:
     bool bt_enemy_at_home();     // 敌方是否已逼近我方城市（防御触发条件）
     bool enemy_near(double dr, double ur, double radius);   // 指定点半径内是否有可见敌军
     void demand_build();         // 建造需求（房屋 / 冲铜器链 / 学院 / 农田 / 箭塔）
+    void demand_dropoff();       // 资源点太远时，就近补建谷仓/仓库
+    double nearest_dropoff_dist(int resType, double dr, double ur);  // 最近的存放建筑距离
+    bool block_is_standable(int i, int j);   // 单格是否可站立（排除水/斜坡/水边/建筑/资源）
     void demand_produce();       // 生产需求（村民）
     void demand_gather();        // 采集需求（食物 / 木 / 石 / 金 / 打猎 / 农田）
-    void demand_scout();         // 探路（祭司探索未探索区域）
+    void demand_scout();         // 探路（祭司环形广度优先探索）
+    void demand_scout_frontier();// 【旧逻辑，保留但不使用】前沿点 + 步长选点
     void bt_dispatch();          // 任务排序 + 派发
 
     // ---- 统计辅助 ----
