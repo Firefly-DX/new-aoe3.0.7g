@@ -58,6 +58,9 @@ private:
     int nextTaskId = 0;
     int phase = 0;                // 阶段状态机：1冲铜器 2发展军事 3反攻
     bool huntStarted = false;     // 打猎开关（人口/木头到位后锁存，开了一直开）
+    bool berryPhase = true;       // 浆果阶段：城边那几丛采完就结束，之后不再采浆果
+    bool berrySeen  = false;      // 是否已见到过城边的浆果丛（防止开局没探到就误判结束）
+    int farmTarget = 0;           // 目标农田数（= 打算派去种田的人数，一人一格农田）
 
     void sort_tasks();
     void assign_tasks();
@@ -83,6 +86,8 @@ private:
     bool find_home_spot(int &bx, int &by, int attempt);  // 在箭塔（或市中心）附近找可站立空块
     bool get_defense_anchor(int &cx, int &cy);           // 防御锚点：优先己方箭塔，其次市镇中心
     void scout_retreat(tagArmy *priest);                 // 探图遇敌：朝背离敌人方向撤离
+    bool priest_heal(tagArmy *priest);                   // 空余时间给伤兵回血（true = 已接管祭司）
+    int healTargetSN = -1;                               // 正在治疗的伤兵 SN
     bool find_free_spot_near(int cx, int cy, int r0, int r1, int &bx, int &by);  // 找可站立空块
 
     // ---- 探图时记录发现过的敌人位置 ----
@@ -210,6 +215,7 @@ private:
     int  count_done(int type);
     int  active_build(int btype);
     int  active_gather(int rtype);
+    int  gatherers_on(int resSN);   // 资源点 resSN 上已经派了几个采集村民
     int  active_action(int btype, int action);
     bool has_resource(int rtype);
     bool center_free();
