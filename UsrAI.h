@@ -31,6 +31,7 @@ private:
         UsrIns.lock.unlock();
         return ins.id;
     }
+    // 基类要求的虚函数；本工程从不调用它（ins_ret 靠“只保留最近 N 条”自然淘汰）。
     void clearInsRet() override
     {
         tagUsrGame.clearInsRet();
@@ -99,6 +100,9 @@ private:
     int scoutUnitCheckFrame = 0;                        // 上次卡住检查的帧号（侦察兵）
     double scoutUnitCheckDR = -1, scoutUnitCheckUR = -1; // 侦察兵的位置采样
     int scoutUnitOrderFrame = 0;                        // 侦察兵移动指令上次下达帧（节流）
+    bool scoutEverMade = false;   // 是否已经有过侦察兵（全局只造一个，阵亡也不补）
+    double scoutLastDR = 0, scoutLastUR = 0;  // 侦察兵最后已知位置（阵亡时用来记敌方位置）
+    bool scoutSeenAlive = false;             // 本阶段见过活着的侦察兵吗（用来识别“它没了”）
 
     // ---- 回村 ----
     // 回村目标不能取市镇中心自己占的块（那是建筑，必然不可达，会让祭司卡住），
@@ -109,6 +113,11 @@ private:
     void recall_priest_home(tagArmy *priest);            // 派祭司回村（带节流与卡住换点）
     bool find_home_spot(int &bx, int &by, int attempt);  // 在箭塔（或市中心）附近找可站立空块
     bool get_defense_anchor(int &cx, int &cy);           // 防御锚点：优先己方箭塔，其次市镇中心
+    bool home_center(double &dr, double &ur);            // 我方市镇中心的细节坐标（false = 还没建成）
+    double nearest_enemy_tower_dist(double dr, double ur);   // 最近的敌方箭塔距离（格）
+    // 该点是否落在“敌方箭塔射程 + margin 格”以内（反攻时守“不得进入箭塔射程”那条规矩）
+    bool point_in_enemy_tower_range(double dr, double ur, double marginBlocks);
+    void record_enemy_positions();   // 每帧记录敌方位置（建筑/部队都算，见实现）
     void scout_retreat(tagArmy *priest);                 // 探图遇敌：朝背离敌人方向撤离
     bool priest_heal(tagArmy *priest);                   // 空余时间给伤兵回血（true = 已接管祭司）
     int healTargetSN = -1;                               // 正在治疗的伤兵 SN
@@ -128,7 +137,7 @@ private:
     // 祭司走到半径 ~18 就全看见了，1 分半就回村，半径 20~40 那片全黑着。
     int ringRadius = 0;                        // 当前正在搜索的环半径（块）
     int ringIndex = 0;                         // 当前环上的路点下标
-    bool next_ring_point(int &bx, int &by, bool nearOnly = true);
+    bool next_ring_point(int &bx, int &by);   // 环半径封顶 SCOUT_RING_MAX（不再有“绝望探图”）
 
     // ---- 侦察骑兵：DFS（后期"找敌军大本营"专用）----
     // 盯着**前沿格**（已知可站立、且邻域挨着 MAPPATTERN_UNKNOWN 的格子）一路往深处扎，
@@ -147,6 +156,7 @@ private:
     // 水域及其相邻一格都视为"不可站立"：单位贴着水边寻路容易卡住
     bool block_is_water_side(int x, int y);
     int arrowTowerTarget = 1;        // 目标箭塔数量（前期 1 座即可，进铜器后再补）
+    int towerPeak = 0;               // 曾经拥有过的最多箭塔数（被拆掉后要补回来）
     bool arrowTowerResearched = false;   // 箭塔科技是否已研发
     int arrowTowerResearchId = -1;   // 箭塔科技研发指令 id（-1 表示未在研）
     std::unordered_map<int,int> towerTargetSN;  // 箭塔 SN → 已下达的集火目标 SN（避免每帧重复索敌）
@@ -195,17 +205,53 @@ private:
     bool compositeBowReady();        // 复合弓科技是否已升完
     bool compositeBowUrgent();       // 是否已进入"必须尽快升完复合弓"的冲刺窗口
     bool rangeReservedForResearch(); // 靶场是否需要让位给科技（冲刺窗口且未升完）
+    // “正在冲复合弓兵”：科技已升完、但复合弓兵还没攒够推图数量
+    // （用户 2026-09 要求“优先供给造复合弓兵”）。为真时：
+    //   · demand_research 暂停一切**要花食物或黄金**的研发，资源全给靶场造兵；
+    //   · demand_gather 把采金名额从 total/8 提到 total/5（每个兵要 20 金）。
+    bool rushing_composite_bowman();
 
     // ==================== 第三阶段：反攻（转化敌方武器工程厂取胜）====================
     int enemySiegeSN = -1;                        // 敌方武器工程厂 SN
     double enemySiegeDR = -1, enemySiegeUR = -1;  // 敌方武器工程厂细节坐标
     void demand_attack();                         // 反攻需求
+    // 敌方“厂区祭司猎手小队”还剩几个（word 文档：3 骑兵 + 2 战车射手，
+    //  专门猎杀距厂 20 格内的玩家祭司）。只数**机动兵种**（骑兵/战车/战车射手）——
+    //  步兵追不上速度 2.24 的祭司，构不成威胁。祭司上场前要等它归零。
+    int  enemy_hunter_count();
+
     // 反攻阶段"上一次给每个单位下的目标"（单位 SN → 目标 SN；-1 = 正在推向敌营）。
     // 只在"目标变了"或"单位空闲（上一条指令已完成）"时才重下指令：
     // 每帧重下会被内核 suspendRelation 掉关系，"走过去 → 攻击/拆建筑"的蓄力阶段
     // 永远走不完（Core.cpp 里箭塔"每帧重下指令导致永远打不出伤害"就是这个坑）。
     std::unordered_map<int,int> attackOrderSN;
     int attackConvertSN = -1;                     // 祭司在反攻阶段正在转化的目标 SN
+
+    // ---- 第三阶段反攻状态机（见 UsrAI.cpp 的 demand_attack）----
+    //   0 = 未触发    1 = 集结（等 10 个复合弓兵 + 全队到位）
+    //   2 = 清敌方野战军    3 = 拆箭塔    4 = 祭司转化武器工程厂（胜利）
+    // 编码约定（存 attackOrderSN 的值）：>=0 = 攻击目标 SN；-1 = 正在走集结点；
+    //   -2 = 正在走敌营（塔清完之后）。
+    int    assaultState = 0;
+    int    assaultStageFrame = 0;      // 进入当前状态的帧（集结/诱敌超时兜底用）
+    // 状态 2“拉锯诱杀”：上次压上勾引线的帧（0 = 本轮还没压上过）。
+    // 用法见 UsrAI.cpp 的 BAIT_TRIGGER_DIST / BAIT_GIVEUP_MS。
+    int    lastBaitPushFrame = 0;
+    bool   enemyFarFound = false;      // 是否已记下“100 格外的敌方目标”
+    double enemyFarDR = 0, enemyFarUR = 0;   // 那个目标的位置（敌方基地未直接看到时的替代锚点）
+    double stageDR = 0, stageUR = 0;   // 集结点/前线站位点（保证在敌方箭塔射程之外）
+    int    assaultLogFrame = 0;        // 反攻状态日志的上次输出帧（每 5 秒一条，调参用）
+    int    siegePriestStuckFrame = 0;  // 转化阶段的祭司卡住检测（与防守那套分开，避免打架）
+    double siegePriestStuckDR = 0, siegePriestStuckUR = 0;
+    int    weakKillFrame = 0;          // 自裁弱兵的上次执行帧（节流，见 demand_army）
+    // 反攻部队“卡住”检测（每 3 秒采样一次位置；见 demand_attack 第 7 步）
+    std::unordered_map<int,int> unitStuckKey;    // 单位 SN → 上次采样的位置（打包）
+    std::unordered_map<int,int> unitStuckFrame;  // 单位 SN → 上次采样的帧号
+    // ---- 风筝（用户 2026-09：“反攻时进攻击范围就退到安全距离”）----
+    // 单位 SN → 状态：>0 = 攻击窗口截止帧（已在射程里，允许打一阵）；
+    //               -1 = 正在后撤；0（或不存在）= 自由进攻
+    // 实现与理由见 UsrAI.cpp 顶部的 KITE_* 常量说明。
+    std::unordered_map<int,int> kiteUntilFrame;
 
     // ==================== 行为树 ====================
 public:
@@ -252,7 +298,6 @@ private:
     bool bt_enemy_at_home();     // 敌方是否已逼近我方城市（防御触发条件）
     bool enemy_near(double dr, double ur, double radius);   // 指定点半径内是否有可见敌军
     void demand_build();         // 建造需求（房屋 / 冲铜器链 / 学院 / 农田 / 箭塔）
-    void demand_dropoff();       // 资源点太远时，就近补建谷仓/仓库
     double nearest_dropoff_dist(int resType, double dr, double ur);  // 最近的存放建筑距离
     bool hunt_dropoff_ready();   // 打猎前置：瞪羚附近是否已有可用存放建筑
     bool block_is_standable(int i, int j);   // 单格是否可站立（排除水/斜坡/水边/建筑/资源）
@@ -278,9 +323,53 @@ private:
     // 资源点才算一次，下一帧自动清空（key = GameFrame）。
     std::unordered_map<int,int> resSpots;
     int resSpotsFrame = -1;
-    // 该资源点是否离市镇中心超过 GATHER_MAX_DIST(100) 格——太远的一律不派人去采
-    // （判定用块坐标的平方距离，整数运算；见 UsrAI.cpp 里的定义与理由）。
-    bool res_too_far(int blockDR, int blockUR);
+    // 全图伐木工的**物理容量**：把所有可砍的树周围的可站立格**去重**后数一遍。
+    // 与 res_stand_spots() 的区别（用户 2026-09 反馈“砍树的人太多导致卡死”）：
+    //   res_stand_spots 是**按单棵树**数的，而密林里相邻几棵树的站位格是
+    //   **互相重叠**的——五棵挨在一起的树每棵都报“能站 3 个”，加起来 15，
+    //   可整片林子实际只有 3~4 个落脚点。按这个虚高的容量派人，多出来的人
+    //   全挤在林子边缘、互相碰撞、够不到采集距离，内核判“行动无用”强制中断关系
+    //   → 村民变 IDLE → 下一帧又被重派过去 → 死循环，看起来就是“一群伐木工堵在树林里”。
+    //   用它给伐木总人数封顶，就不会出现“人比落脚点多”的堵死。
+    int  wood_capacity();
+    // 伐木人数上限 = clamp(min(WOOD_MAX_GATHERERS, wood_capacity()),
+    //                       WOOD_MIN_GATHERERS, +∞)
+    //   · WOOD_MAX_GATHERERS：软件上限（后期食物为主，不拿人力硬堆木头）；
+    //   · wood_capacity()   ：物理上限（全图树林站不下这么多人）；
+    //   · WOOD_MIN_GATHERERS：保底（房屋/农田/补仓库的木头不能断供）。
+    int  wood_gather_limit();
+    // 上面那两个的每帧缓存（key = GameFrame，跟 resSpots 一样按需惰性计算）
+    int woodCapCache = 0;
+    int woodCapFrame = -1;
+    int gatherLogFrame = 0;   // 每 5 秒报一次采集人力分配用的节流
+    // “ 60 格内还有可砍的树吗”的每帧缓存（res_too_far 用：近处没树了才放宽树半径）
+    bool treeNearHome = false;
+    int  treeNearFrame = -1;
+    // ---- 村民 → 上次被派活的帧号（AI 侧的“他刚被派去哪儿了”）----
+    // 【这条不变量是 2026-09 用户反馈“在干一件事的村民不要让他干别的事”的收敛方案】
+    //   判“他闲不闲”只能看内核的 `NowState`，而 `HumanAction` 是**异步**的：
+    //   本帧刚下的指令，要到**下一帧**的 infoShare 才会把 NowState 从 IDLE 改掉。
+    //   于是同一帧里第二个派活入口会把他再派一次、覆盖掉前一条指令。
+    //   现在把它做成**统一判据**（见 .cpp 的 farmer_available）：
+    //     任何派活入口都必须先问它 —— “内核说他在忙”或“我刚派过他”一律不碰。
+    std::unordered_map<int,int> farmerOrderFrame;
+    // 能不能给这个村民派新活（内核忙 / 刚派过 → 不能）
+    bool farmer_available(tagFarmer &f);
+    // 仅查询“我最近刚派过他吗”（无副作用 —— farmer_available 会清过期项，
+    // recycle_tasks 只想知道答案，不能改记录）
+    bool farmer_just_ordered(int sn);
+    // 记下“我这帧派过他了”（派活成功后必须调用）
+    void mark_farmer_order(int sn);
+    // 村民“危险撤离”的上次下令帧（SN → 帧号）。
+    // 【为何必须节流】只要村民保持 IDLE 且身处危险半径内，就会每帧重下 HumanMove；
+    //   而内核的 addRelation 每次都先 suspendRelation（initAction + **清空路径**），
+    //   村民会原地拖动、永远走不出去。2 秒下一次就够。
+    std::unordered_map<int,int> escapeFrame;
+    // 该资源点是否“离市镇中心太远”。普通资源 60 格，石/金放宽到 100
+    //（近处没树时树也放宽）。实现见 UsrAI.cpp。
+    bool res_too_far(int type, int blockDR, int blockUR);
+    // 该点附近是否“很危险”：有可见的敌方单位，或者有活狮子（狮子的攻击距离 10 格）。
+    bool gather_spot_dangerous(double dr, double ur);
     int  pending_build_wood();      // 队列里还没建成的建造任务总共要花多少木头
     int  active_action(int btype, int action);
     bool has_resource(int rtype);
