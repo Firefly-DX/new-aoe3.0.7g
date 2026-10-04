@@ -123,7 +123,8 @@ static double scoutUnitCheckDR = -1, scoutUnitCheckUR = -1;
 static int scoutUnitOrderFrame = 0;                  // 侦察兵移动指令上次下达帧（节流）
 static bool scoutEverMade = false;   // 是否已经有过侦察兵（全局只造一个）
 static double scoutLastDR = 0, scoutLastUR = 0;      // 侦察兵最后已知位置
-static bool scoutSeenAlive = false;                  // 本阶段见过活着的侦察兵吗
+static bool scoutSeenAlive = false;                  // 已见到活着的侦察兵
+static bool scoutDeathPending = false;               // 阵亡位置等待反攻阶段使用
 
 static int homeSpotX = -1, homeSpotY = -1;   // 回村落脚点块坐标
 static int homeSpotTry = 0;                  // 找落脚点的尝试次数（卡住时向外扩）
@@ -185,12 +186,11 @@ static int    baitScoutBlood = -1;                  // 上一帧血量（掉血 
 static bool   baitScoutReturning = false;
 // 摘标志后的冷却帧：这段时间不选新突击者（防“刚摘就又抓同一个”）。
 static int    baitScoutSwitchFrame = 0;
+static const char *baitScoutReason = "待选";
 static bool   baitScoutBack = false;
 static double slowPushDR = 0, slowPushUR = 0;       // 队伍推进点（“主动进攻”逐步前压的目标）
 static bool   slowPushValid = false;
 static double lastAdvanceDR = -1, lastAdvanceUR = -1;
-static double baitLineDR = -1, baitLineUR = -1, baitNoDeepen = 0;
-static double baitLineAnchorDR = 0, baitLineAnchorUR = 0;
 static bool   enemyFarFound = false;      // 是否已记下"100 格外的敌方目标"
 static double enemyFarDR = 0, enemyFarUR = 0;
 
@@ -396,9 +396,7 @@ static const int TECH_WOOD_RESERVE = 100;
 // ============ 第三阶段反攻：集结 → 诱杀野战军 → 齐射拆箭塔 → 祭司转化 ============
 static const int ASSAULT_BOWMAN_MIN = 18;
 static const int ASSAULT_FORCE_MIN = 23;
-static const int ENEMY_ALERT_DIST = 20;
 // 勾引线：踩进警戒半径 1 格。守军必须**自己走出来**才能打到我们 —— 一走就离开塔的掩护。
-static const int BAIT_TRIGGER_DIST = ENEMY_ALERT_DIST - 1;   // 19
 // ---- 拉锯的两段时长（毫秒）----
 static const int RALLY_DIST = 14;
 // ---- 前线集合点（村庄外 RALLY_AWAY_DIST 格）----
@@ -424,7 +422,7 @@ static const int ASSAULT_TOWER_RADIUS = 24;     // 敌营这个范围内的箭�
 static const int ASSAULT_ENGAGE_DIST = 20;      // 单位主动交战的半径
 static const int ASSAULT_ROLLBACK_MIN     = 3;
 static const int ASSAULT_TOWER_COMMIT_MS  = 15000;
-static const int SIEGE_BACK_DIST          = 6;
+static const int SIEGE_BACK_DIST          = 2;
 static const int ASSAULT_SPREAD_HALF = 2;
 static const int SPREAD_EXTRA_RINGS = 3;        // 最多往外多扩 3 圈（2+3=5 → 11x11）
 static const int ASSAULT_PROTECT_DIST = 8;      // 转化阶段部队停在敌营外几格（护祭司但不挡路）
@@ -434,13 +432,9 @@ static const int ASSAULT_CLEAR_CONFIRM_MS = 8000;
 static const int ENEMY_DEAD_CONFIRM_MS = 6000;   // 连续多久没再见到才考虑“已消灭”
 static const int ENEMY_DEAD_SIGHT_DIST = 12;     // 我方要有人站到它最后位置这么近才算“看着那儿”
 // ---- 诱敌突击者的参数（见文件头部 baitScout*/slowPush* 的说明）----
-// 诱饵**最多站到**敌营外多少格：对弓兵来说就是主力线（22 格），完全不深入。
-static const int BAIT_SCOUT_MAX_DEPTH    = BAIT_TRIGGER_DIST;
-// 勾引彻底失败（连续这么久视野里没有任何敌人）⇒ 主动转去拆塔。
 static const int BAIT_SCOUT_STEP         = 1;    // 突击者每次朝敌营挪几格
 static const int BAIT_SCOUT_GAP          = 20;   // 两次移动指令的最小帧间隔（防内核反复清路径）
 static const int SLOW_PUSH_STEP          = 2;    // 突击者每挪一步，其余部队推进几格
-static const int SLOW_PUSH_SAFE_DIST     = 22;   // 诱敌阶段推进点的起始上限（主动进攻会按塔射程继续压）
 static const int BAIT_SCOUT_SWITCH_MS    = 5000; // 摘掉突击者标志后多久才能再选一个
 static const int WEAK_KILL_INTERVAL_MS = 3000;  // 自裁弱兵的节流（毫秒）
 
@@ -464,6 +458,7 @@ static const int DEFENSE_ORDER_MS = 1000;
 // 超出后要给大额惩罚，免得祭司丢下脚边的敌人去追远处的（路上还会被反杀）。
 static const int PRIEST_CONVERT_RADIUS = 12;
 static const int PRIEST_BACK_DIST = 4;
+static const int PRIEST_ASSAULT_START_MIN = 26;
 
 static const double PRIEST_CONVERT_SIEGE_BONUS = 150.0;
 static const double PRIEST_CONVERT_PHALANX_BONUS = 180.0;
@@ -663,9 +658,13 @@ void bt_sync()
         baitScoutBlood = -1; baitScoutBack = false; slowPushValid = false;
         lastAdvanceDR = -1; lastAdvanceUR = -1;
         granaryFarmSites.clear();
+        scoutSeenAlive = false; scoutDeathPending = false;
+        scoutLastDR = 0; scoutLastUR = 0;
+        enemyFarFound = false; enemyFarDR = 0; enemyFarUR = 0;
+        enemySiegeSN = -1; enemySiegeDR = -1; enemySiegeUR = -1;
         enemyLedgerSeenFrame.clear(); enemyLedgerDR.clear();
         enemyLedgerUR.clear(); enemyLedgerDead.clear();
-        baitLineDR = -1; baitLineUR = -1; baitNoDeepen = 0;
+        baitScoutReason = "待选";
     }
     lastSeenGameFrame = info.GameFrame;
 
@@ -677,9 +676,7 @@ void bt_sync()
         phase = 2;   // 铜器时代：发展军事、防守三波
     }
 
-    // 敌方位置记录：每帧调一次，但**只有第三阶段（侦察骑兵出门探图后）才真正生效**
-    //（见 record_enemy_positions 开头）。放在 phase 算完之后调，避免阶段切换那一帧
-    // 读到上一帧的 phase；后面的 demand_attack / demand_scout 都能用上同一帧的最新位置。
+    // 全程跟踪侦察兵；敌营定位只在反攻阶段使用。
     record_enemy_positions();
     update_enemy_ledger();
 
@@ -2126,7 +2123,22 @@ static int enemy_ledger_total() { return (int)enemyLedgerSeenFrame.size(); }
 // ---------- 敌方位置记录 ----------
 void record_enemy_positions()
 {
-    if (phase < 3) return;      // 第三阶段之前不记录（见上）
+    // 己方军队不受迷雾过滤；由出现后消失确认阵亡，保留最后可取得的位置。
+    bool scoutAlive = false;
+    for (const tagArmy &a : info.armies) {
+        if (a.Sort != AT_SCOUT) continue;
+        scoutAlive = true;
+        scoutLastDR = a.DR;
+        scoutLastUR = a.UR;
+        break;
+    }
+    if (scoutAlive) {
+        scoutSeenAlive = true;
+    } else if (scoutSeenAlive) {
+        scoutSeenAlive = false;
+        scoutDeathPending = true;
+    }
+    if (phase < 3) return;
 
     const double bsl = BLOCKSIDELENGTH;
     double homeDR = 0, homeUR = 0;
@@ -2164,23 +2176,13 @@ void record_enemy_positions()
             enemyFarFound = true;
         }
     }
-    bool scoutAlive = false;
-    for (tagArmy &a : info.armies)
-        if (a.Sort == AT_SCOUT) {
-            scoutAlive = true;
-            scoutLastDR = a.DR;
-            scoutLastUR = a.UR;
-            break;
-        }
-    if (scoutAlive) {
-        scoutSeenAlive = true;
-    } else if (scoutSeenAlive) {
-        scoutSeenAlive = false;              // 只处理一次
-        double d = haveHome ? calDistance(scoutLastDR, scoutLastUR, homeDR, homeUR) : 0.0;
-        if (enemySiegeSN == -1 && haveHome && d > HOME_DEFEND_RADIUS * bsl) {
+    if (scoutDeathPending) {
+        scoutDeathPending = false;
+        if (enemySiegeSN == -1) {
             enemyFarDR = scoutLastDR;
             enemyFarUR = scoutLastUR;
             enemyFarFound = true;
+            DebugText("侦察骑兵阵亡：以最后位置作为敌营搜索点");
         }
     }
 }
@@ -2274,7 +2276,8 @@ static bool kite_archer_step(tagArmy &a, int wantSN)
 
     // 下攻击指令的**唯一出口**：onlyIfInReach = 退不了时才要求“已在自己射程内”
     auto shoot = [&](bool onlyIfInReach) {
-        if (wantSN < 0 || a.WorkObjectSN == wantSN) return;
+        if (wantSN < 0 || (a.WorkObjectSN == wantSN
+            && a.NowState != HUMAN_STATE_IDLE)) return;
         if (info.GameFrame - unitFireFrame[a.SN] < RANGED_FIRE_GAP) return;
         if (onlyIfInReach && td > reach) return;
         attackOrderSN[a.SN] = wantSN;
@@ -2680,6 +2683,13 @@ void demand_attack()
     // 敌方箭塔射程：DIS_ARROWTOWER(7) + 谷仓升级/木材加工/工艺(+3) = 10 格（敌方科技全满）
     const double towerRange = (double)(DIS_ARROWTOWER + ENEMY_DIS_ADD_TOWER);
     const int toFrames = (TimePerFrame > 0) ? TimePerFrame : 40;
+    const bool priestMayJoin = (long long)info.GameFrame * toFrames
+        >= (long long)PRIEST_ASSAULT_START_MIN * 60000;
+    // 26 分钟前只在基地待命；敌袭时留给原防守模块处理。
+    if (!priestMayJoin && !bt_enemy_at_home()) {
+        for (tagArmy &a : info.armies)
+            if (a.Sort == AT_PRIEST) recall_priest_home(&a);
+    }
 
     // ---- 1) 敌方位置：在 record_enemy_positions() 里每帧无条件记录 ----
     // （bt_sync 最先调用；这里只负责读出来用，不再重复记录。）
@@ -2809,7 +2819,6 @@ void demand_attack()
         assaultStageFrame = info.GameFrame;
     }
 
-    const bool forbidTowerRange = (assaultState <= 2);
 
     // ---- 6) 这一轮集火拆哪座箭塔（全队打同一座：拆得快、少挨打）----
     int focusTower = -1;
@@ -2833,6 +2842,17 @@ void demand_attack()
     }
 
     if (assaultState == 2 && haveHome) {
+        if (!slowPushValid) {
+            double sumDR = 0, sumUR = 0; int count = 0;
+            for (const tagArmy &a : info.armies) {
+                if (a.Sort == AT_PRIEST || a.Sort == AT_SCOUT || a.SN == weakKillSN) continue;
+                sumDR += a.DR; sumUR += a.UR; ++count;
+            }
+            if (count > 0) {
+                slowPushDR = sumDR / count; slowPushUR = sumUR / count;
+                slowPushValid = true;
+            }
+        }
         double scDR = 0, scUR = 0; int scBlood = 0; bool scAlive = false;
         if (baitScoutSN >= 0) {
             for (tagArmy &a : info.armies)
@@ -2863,35 +2883,43 @@ void demand_attack()
             if (baitScoutSN >= 0) {
                 for (tagArmy &a : info.armies)
                     if (a.SN == baitScoutSN) {
+                        // 退回点在起点后方，避免刚选中就原地解除。
+                        double rx = homeDR - a.DR, ry = homeUR - a.UR;
+                        const double rl = sqrt(rx * rx + ry * ry);
                         baitScoutHomeDR = a.DR; baitScoutHomeUR = a.UR;
+                        if (rl > 1e-6) {
+                            baitScoutHomeDR += rx / rl * KITE_RETREAT_STEP * bsl;
+                            baitScoutHomeUR += ry / rl * KITE_RETREAT_STEP * bsl;
+                        }
                         scAlive = true; scDR = a.DR; scUR = a.UR; scBlood = a.Blood;
                         break;
                     }
                 baitScoutBlood = -1;
                 baitScoutFrame = 0;
                 baitScoutReturning = false;
+                baitScoutBack = false; baitScoutReason = "接近";
             }
         }
         // ---- 步骤 2 / 3 ----
         if (baitScoutSN >= 0 && scAlive) {
-            double nd = 1e18;
+            double nd = 1e18, probeDR = tx, probeUR = ty;
             bool locked = false;
             for (tagArmy &e : info.enemy_armies) {
                 const double d = calDistance(scDR, scUR, e.DR, e.UR);
-                if (d < nd) nd = d;
+                if (d < nd) { nd = d; probeDR = e.DR; probeUR = e.UR; }
                 if (e.WorkObjectSN == baitScoutSN) locked = true;   // 有敌人正锁着它
             }
             const bool hurt = (baitScoutBlood >= 0 && scBlood < baitScoutBlood);  // 掉血 = 挨打
-            const bool tooDeep = (calDistance(scDR, scUR, tx, ty) / bsl
-                                  <= BAIT_SCOUT_MAX_DEPTH);
-            // 撤退状态保持到返回，不因敌人暂时离开视野而重新前进。
-            const bool back = baitScoutReturning || tooDeep || locked || hurt;
+            const bool closeEnemy = nd < KITE_FLEE_DIST * bsl;
+            const bool back = baitScoutReturning || closeEnemy || locked || hurt;
+            baitScoutReason = locked ? "被锁定" : hurt ? "掉血"
+                : closeEnemy ? "贴脸" : back ? "撤回" : "接近";
             baitScoutBack = back;                      // 供逐单位循环判断“现在该撤，别下攻击指令”
             if (back) baitScoutReturning = true;       // 记下“它退过”，才允许在初始位置摘标志
             const double homeDist = calDistance(scDR, scUR, baitScoutHomeDR, baitScoutHomeUR);
             if (baitScoutReturning && homeDist <= 2.0 * bsl) {
                 // 步骤 3：回到初始位置（不管此刻身边有没有敌人）⇒ 摘标志 + 冷却
-                baitScoutSN = -1;
+                baitScoutSN = -1; baitScoutReason = "冷却";
                 baitScoutSwitchFrame = info.GameFrame + BAIT_SCOUT_SWITCH_MS / toFrames;
             } else if (info.GameFrame - baitScoutFrame >= BAIT_SCOUT_GAP) {
                 bool canShoot = false;
@@ -2905,7 +2933,7 @@ void demand_attack()
                 }
                 double mx = baitScoutHomeDR, my = baitScoutHomeUR;
                 if (!back && !canShoot) {
-                    double dx = tx - scDR, dy = ty - scUR;
+                    double dx = probeDR - scDR, dy = probeUR - scUR;
                     const double len = sqrt(dx * dx + dy * dy);
                     if (len > 1e-6) {
                         mx = scDR + dx / len * BAIT_SCOUT_STEP * bsl;
@@ -2922,41 +2950,20 @@ void demand_attack()
                         mby = fy;
                     }
                 }
+                if (!canShoot && !landing_ok(mbx, mby, baitScoutSN))
+                    baitScoutReason = "无可用落点";
                 if (!canShoot && landing_ok(mbx, mby, baitScoutSN)) {
                     HumanMove(baitScoutSN, (mbx + 0.5) * bsl, (mby + 0.5) * bsl);
                     baitScoutFrame = info.GameFrame;
                     // 突击者往前挪 ⇒ 其余部队跟着推进 1~2 格（步骤 2 后半句）
                     if (!back) {
-                        if (!slowPushValid) {          // 懒初始化：从部队质心起步
-                            double sx2 = 0, sy2 = 0; int n2 = 0;
-                            for (tagArmy &a : info.armies) {
-                                if (a.Sort == AT_PRIEST || a.Sort == AT_SCOUT) continue;
-                                sx2 += a.DR; sy2 += a.UR; n2++;
-                            }
-                            slowPushDR = (n2 > 0) ? sx2 / n2 : tx;
-                            slowPushUR = (n2 > 0) ? sy2 / n2 : ty;
-                            slowPushValid = true;
-                        }
-                        const double cur = calDistance(slowPushDR, slowPushUR, tx, ty) / bsl;
-                        if (cur > SLOW_PUSH_SAFE_DIST) {
-                            double dx2 = tx - slowPushDR, dy2 = ty - slowPushUR;
-                            const double l2 = sqrt(dx2 * dx2 + dy2 * dy2);
-                            if (l2 > 1e-6) {
-                                dx2 /= l2; dy2 /= l2;
-                                double step = SLOW_PUSH_STEP;
-                                if (cur - step < SLOW_PUSH_SAFE_DIST)
-                                    step = cur - SLOW_PUSH_SAFE_DIST;
-                                double nx2 = slowPushDR + dx2 * step * bsl;
-                                double ny2 = slowPushUR + dy2 * step * bsl;
-                                for (int g = 0; g < 8; ++g) {      // 别把推进点放进塔射程
-                                    if (nearest_enemy_tower_dist(nx2, ny2)
-                                        > towerRange + TOWER_SAFE_MARGIN) break;
-                                    nx2 -= dx2 * ASSAULT_BACKSTEP * bsl;
-                                    ny2 -= dy2 * ASSAULT_BACKSTEP * bsl;
-                                }
-                                slowPushDR = nx2;
-                                slowPushUR = ny2;
-                            }
+                        // 随诱饵逐步推进，不设置敌营外的固定停留距离。
+                        const double dx2 = probeDR - slowPushDR, dy2 = probeUR - slowPushUR;
+                        const double len2 = sqrt(dx2 * dx2 + dy2 * dy2);
+                        if (slowPushValid && len2 > 1e-6) {
+                            const double step = std::min((double)SLOW_PUSH_STEP * bsl, len2);
+                            slowPushDR += dx2 / len2 * step;
+                            slowPushUR += dy2 / len2 * step;
                         }
                     }
                 }
@@ -2968,41 +2975,8 @@ void demand_attack()
     // ---- 7) 逐单位下令 ----
     const int stuckSampleInterval = (3000 / toFrames) < 1 ? 1 : (3000 / toFrames);
 
-    // ---- 本帧的勾引线 / 诱杀线 + 给远程兵的硬约束 noDeepenDist ----
-    double lineDR = tx, lineUR = ty, noDeepenDist = 0.0;
-    if (assaultState == 2 && haveHome) {
-        const bool recalc = (baitLineDR < 0)
-                            || (calDistance(baitLineAnchorDR, baitLineAnchorUR, tx, ty)
-                                > 5.0 * bsl)
-                            || (nearest_enemy_tower_dist(baitLineDR, baitLineUR)
-                                <= towerRange + TOWER_SAFE_MARGIN);
-        if (recalc) {
-            const double nominal = SLOW_PUSH_SAFE_DIST;
-            double dx = homeDR - tx, dy = homeUR - ty;
-            double len = sqrt(dx * dx + dy * dy);
-            if (len < 1e-6) { dx = -1.0; dy = 0.0; len = 1.0; }
-            dx /= len;
-            dy /= len;
-            double lx = tx + dx * nominal * bsl;
-            double ly = ty + dy * nominal * bsl;
-            for (int guard = 0; guard < 12; ++guard) {
-                if (nearest_enemy_tower_dist(lx, ly)
-                    > towerRange + TOWER_SAFE_MARGIN) break;
-                lx += dx * ASSAULT_BACKSTEP * bsl;
-                ly += dy * ASSAULT_BACKSTEP * bsl;
-            }
-            baitLineDR = lx;
-            baitLineUR = ly;
-            baitNoDeepen = calDistance(lx, ly, tx, ty) / bsl;
-            baitLineAnchorDR = tx;
-            baitLineAnchorUR = ty;
-        }
-        lineDR = baitLineDR;
-        lineUR = baitLineUR;
-        noDeepenDist = baitNoDeepen;
-    }
-
-    // 选敌人：就近；可选"不许在塔射程内"；可选"护祭司"（连正在咬祭司的远处敌人也打）
+    int towerPositionRejected = 0, noTargetUnits = 0;
+    // 选敌人：检查我方预计开火位置，而非敌人与塔/工程厂的距离。
     // siegeFirst：状态 2/3 里把投石车排到最前
     const bool siegeFirst = (assaultState >= 2 && assaultState <= 3);
     auto pickEnemy = [&](tagArmy &a, bool forbidRange, bool protectPriest,
@@ -3012,17 +2986,19 @@ void demand_attack()
         for (tagArmy &e : info.enemy_armies) {
             double d = calDistance(a.DR, a.UR, e.DR, e.UR);
             bool inReach = (d <= maxDist * bsl);
-            if (!inReach && protectPriest && priest != nullptr)
+            if (!inReach && protectPriest && priestMayJoin && priest != nullptr)
                 inReach = (calDistance(priest->DR, priest->UR, e.DR, e.UR)
                            <= ASSAULT_ENGAGE_DIST * bsl);
             if (!inReach) continue;
-            if (forbidRange
-                && point_in_enemy_tower_range(e.DR, e.UR, TOWER_SAFE_MARGIN))
-                continue;
-            if (noDeepenDist > 0.0
-                && noDeepenDist - calDistance(e.DR, e.UR, tx, ty) / bsl
-                   > own_attack_range(a.Sort))
-                continue;
+            if (forbidRange && d > own_attack_range(a.Sort) * bsl) {
+                const double reach = own_attack_range(a.Sort) * bsl;
+                const double fireDR = e.DR + (a.DR - e.DR) * reach / d;
+                const double fireUR = e.UR + (a.UR - e.UR) * reach / d;
+                if (point_in_enemy_tower_range(fireDR, fireUR, TOWER_SAFE_MARGIN)) {
+                    ++towerPositionRejected;
+                    continue;
+                }
+            }
             // 投石车优先：5 秒一发 50 点，而我们复合弓兵 45 血 ⇒ 挨一发就死。
             //   加成取 100 格（远大于 ASSAULT_ENGAGE_DIST）⇒ 在交战半径内就优先，
             //   但不影响“半径外不打”。只在状态 2/3 生效（状态 4 不能让队伍被拉走）。
@@ -3042,21 +3018,8 @@ void demand_attack()
         if (len < 1e-6) { dx = -1.0; dy = 0.0; len = 1.0; }
         advDR = tx + dx / len * (ASSAULT_PROTECT_DIST * bsl);
         advUR = ty + dy / len * (ASSAULT_PROTECT_DIST * bsl);
-    } else if (assaultState == 2 && haveHome) {
-        if (slowPushValid) {
-            double dx = homeDR - tx, dy = homeUR - ty;
-            const double len = sqrt(dx * dx + dy * dy);
-            if (len > 1e-6) {
-                dx /= len; dy /= len;
-                for (int guard = 0; guard < 12; ++guard) {
-                    if (!point_in_enemy_tower_range(slowPushDR, slowPushUR, TOWER_SAFE_MARGIN)) break;
-                    slowPushDR += dx * ASSAULT_BACKSTEP * bsl;
-                    slowPushUR += dy * ASSAULT_BACKSTEP * bsl;
-                }
-            }
-            advDR = slowPushDR; advUR = slowPushUR;
-        }
-        else               { advDR = lineDR;     advUR = lineUR; }
+    } else if (assaultState == 2 && slowPushValid) {
+        advDR = slowPushDR; advUR = slowPushUR;
     }
     // 移动目标编码：-1 = 回集结点，-2 = 冲敌营，-4 = 回保护位，
     //                -6 = 压上勾引，-8 = 拉锯后撤（退回诱杀线）
@@ -3077,7 +3040,7 @@ void demand_attack()
 
     // 撤退优先于转化，避免同一帧的后续命令覆盖撤退。
     bool priestRetreating = false;
-    if (priest != nullptr) {
+    if (priest != nullptr && priestMayJoin) {
         bool priestMayMove = true;
         if (enemy_near(priest->DR, priest->UR, KITE_FLEE_DIST * bsl)) {
             // 只向主力后方短退，绝不把目的地改成基地。
@@ -3207,13 +3170,13 @@ void demand_attack()
 
         const bool archer = (a.Sort == AT_BOWMAN || a.Sort == AT_COMPOSITE_BOWMAN);
 
-        if (a.NowState == HUMAN_STATE_ATTACKING && !archer) continue;
+        if (a.NowState == HUMAN_STATE_ATTACKING && !archer && !army_is_siege(a.Sort)) continue;
 
         int wantSN = -1;      // >=0 = 攻击目标；-1 = 没有可打的目标
         if (assaultState == 1) {
             wantSN = pickEnemy(a, true, false, ASSAULT_STAGE_GUARD_DIST, archer);
         } else if (assaultState == 2) {
-            wantSN = pickEnemy(a, forbidTowerRange, false, ASSAULT_ENGAGE_DIST, archer);
+            wantSN = pickEnemy(a, false, false, ASSAULT_ENGAGE_DIST, archer);
         } else if (assaultState == 3) {
             // 状态 3 = 野战军已清完 → **全军齐射**当前集火的那座箭塔：
             // 先看这轮还有没有敌方单位（工厂可能又出新兵），有就先打人；
@@ -3226,11 +3189,89 @@ void demand_attack()
             wantSN = pickEnemy(a, false, true, ASSAULT_ENGAGE_DIST, archer);
         }
 
+        if (army_is_siege(a.Sort)) {
+            double bowDR = 0, bowUR = 0; int bowCount = 0;
+            for (const tagArmy &o : info.armies) {
+                if (o.SN == baitScoutSN || o.SN == weakKillSN) continue;
+                if (o.Sort != AT_BOWMAN && o.Sort != AT_COMPOSITE_BOWMAN) continue;
+                bowDR += o.DR; bowUR += o.UR; ++bowCount;
+            }
+            if (bowCount > 0) {
+                bowDR /= bowCount; bowUR /= bowCount;
+                double targetDR = tx, targetUR = ty;
+                bool targetVisible = false;
+                for (const tagArmy &e : info.enemy_armies) {
+                    if (e.SN != wantSN) continue;
+                    targetDR = e.DR; targetUR = e.UR; targetVisible = true; break;
+                }
+                for (const tagBuilding &e : info.enemy_buildings) {
+                    if (e.SN != wantSN) continue;
+                    targetDR = e.BlockDR * bsl; targetUR = e.BlockUR * bsl;
+                    targetVisible = true; break;
+                }
+                double ux = targetDR - bowDR, uy = targetUR - bowUR;
+                double ul = sqrt(ux * ux + uy * uy);
+                if (ul < 1e-6 && haveHome) {
+                    ux = bowDR - homeDR; uy = bowUR - homeUR;
+                    ul = sqrt(ux * ux + uy * uy);
+                }
+                if (ul > 1e-6) {
+                    ux /= ul; uy /= ul;
+                    const double behind = (bowDR - a.DR) * ux + (bowUR - a.UR) * uy;
+                    const double range = own_attack_range(a.Sort) * bsl;
+                    // 攻击命令会自动追击；只允许已在弓兵后方、射程内的投石车开火。
+                    if (behind >= bsl && targetVisible
+                        && calDistance(a.DR, a.UR, targetDR, targetUR) <= range) {
+                        if (a.WorkObjectSN != wantSN || a.NowState != HUMAN_STATE_ATTACKING) {
+                            HumanAction(a.SN, wantSN);
+                            attackOrderSN[a.SN] = wantSN;
+                        }
+                        continue;
+                    }
+                    const double rearDR = bowDR - ux * SIEGE_BACK_DIST * bsl;
+                    const double rearUR = bowUR - uy * SIEGE_BACK_DIST * bsl;
+                    const bool oldAttack = a.NowState == HUMAN_STATE_ATTACKING;
+                    if (!oldAttack && info.GameFrame - unitStepFrame[a.SN] < RANGED_STEP_GAP)
+                        continue;
+                    const int cx = (int)(rearDR / bsl), cy = (int)(rearUR / bsl);
+                    int mbx = -1, mby = -1; double best = 1e18;
+                    for (int dx = -3; dx <= 3; ++dx) {
+                        for (int dy = -3; dy <= 3; ++dy) {
+                            const int bx = cx + dx, by = cy + dy;
+                            const double gx = (bx + 0.5) * bsl, gy = (by + 0.5) * bsl;
+                            if ((bowDR - gx) * ux + (bowUR - gy) * uy < SIEGE_BACK_DIST * bsl)
+                                continue;
+                            if (!landing_ok(bx, by, a.SN)) continue;
+                            double score = calDistance(gx, gy, rearDR, rearUR);
+                            if (targetVisible && calDistance(gx, gy, targetDR, targetUR) > range)
+                                score += 10 * bsl;
+                            if (score < best) { best = score; mbx = bx; mby = by; }
+                        }
+                    }
+                    if (mbx >= 0) {
+                        const double gx = (mbx + 0.5) * bsl, gy = (mby + 0.5) * bsl;
+                        const bool staleMove = a.NowState == HUMAN_STATE_WALKING
+                            && calDistance(a.DR0, a.UR0, gx, gy) > bsl;
+                        if (oldAttack || staleMove
+                            || (a.NowState != HUMAN_STATE_WALKING
+                                && calDistance(a.DR, a.UR, gx, gy) > bsl)) {
+                            HumanMove(a.SN, gx, gy);
+                            unitStepFrame[a.SN] = info.GameFrame;
+                            attackOrderSN[a.SN] = -6;
+                        }
+                        cellClaim[(mbx << 12) | mby] = a.SN;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if (wantSN < 0) ++noTargetUnits;
         // 诱饵已独立处理，其余弓兵统一拉扯。
         if (archer && kite_archer_step(a, wantSN)) continue;
 
         // 没有攻击目标 → advance 时直接冲向敌营，否则回集结点（在塔射程之外）待命。
-        // 集结点保留给状态 1（集结）和状态 2 的诱敌期：那两段就是不能进塔射程。
+        // 只有状态 1 使用初始集结点，状态 2 随诱饵推进。
         const int wantCode = (wantSN >= 0) ? wantSN : (advance ? advCode : -1);
 
         int lastCode = -3;    // -3 = 这个单位还没有记录
@@ -3260,8 +3301,6 @@ void demand_attack()
 
             int mbx = -1, mby = -1;
             if (!spread_slot(cx, cy, half, a.SN, mbx, mby)) continue;
-            if (assaultState == 2 && point_in_enemy_tower_range(
-                    (mbx + 0.5) * bsl, (mby + 0.5) * bsl, TOWER_SAFE_MARGIN)) continue;
             const int mdx = a.BlockDR - mbx, mdy = a.BlockUR - mby;
             const double dArea = calDistance(a.DR, a.UR,
                                              (cx + 0.5) * bsl, (cy + 0.5) * bsl);
@@ -3312,10 +3351,13 @@ void demand_attack()
                   + " 走=" + std::to_string(nWalk)
                   + " 打=" + std::to_string(nAtk)
                   + " 忙=" + std::to_string(nWork)
-                  + " 位移=" + std::to_string(nMoved));
+                  + " 位移=" + std::to_string(nMoved)
+                  + " 无目标兵=" + std::to_string(noTargetUnits)
+                  + " 塔位过滤=" + std::to_string(towerPositionRejected)
+                  + " 诱饵状态=" + baitScoutReason);
     }
 
-    if (priest == nullptr || priestRetreating) return;
+    if (priest == nullptr || !priestMayJoin || priestRetreating) return;
     if (bt_enemy_at_home()) return;   // 家里被打：祭司交给 combat_tactic
 
     const bool convertReady = (priest->ConvertCooldown <= 0);   // 冷却中就别下令（白费一次）
