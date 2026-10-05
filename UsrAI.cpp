@@ -1808,7 +1808,7 @@ void demand_gather()
 // ---------- 第二阶段：造兵需求 ----------
 void demand_army()
 {
-    int bowman = 0, composite = 0, cavalry = 0, scout = 0, totalArmy = 0;
+    int bowman = 0, composite = 0, scout = 0, totalArmy = 0;
     bool weakKillAlive = false;            // weakKillSN 还在吗（见它的说明）
     for (tagArmy &a : info.armies) {
         if (a.SN == weakKillSN) weakKillAlive = true;
@@ -1818,7 +1818,6 @@ void demand_army()
         if (a.Sort == AT_COMPOSITE_BOWMAN) composite++;
         if (a.Sort == AT_BOWMAN || a.Sort == AT_COMPOSITE_BOWMAN
             || a.Sort == AT_SLINGER) bowman++;
-        else if (a.Sort == AT_CAVALRY || a.Sort == AT_CHARIOT) cavalry++;
     }
 
     if (scout > 0) scoutEverMade = true;
@@ -1879,18 +1878,6 @@ void demand_army()
                                && composite < ASSAULT_BOWMAN_MIN;
     int target = (phase >= 3) ? armyTarget + 8 : armyTarget;
     if (!rushComposite && totalArmy >= target) return;
-
-    if (phase < 3) {
-        // 马厩：骑兵（需食物 + 黄金）
-        tagBuilding *st = free_building(BUILDING_STABLE);
-        if (st && info.civilizationStage >= CIVILIZATION_BRONZEAGE
-            && cavalry < (target + 2) / 3
-            && info.Meat >= BUILDING_STABLE_CREATE_CAVALRY_FOOD
-            && info.Gold >= BUILDING_STABLE_CREATE_CAVALRY_GOLD) {
-            BuildingAction(st->SN, BUILDING_STABLE_CREATE_CAVALRY);
-            return;
-        }
-    }
 
     int bowmanForTarget = compositeBowReady() ? composite : bowman;
     int bowmanCap = compositeBowReady() ? (target + 1) / 2 : BOWMAN_PRE_TECH_MAX;
@@ -1974,15 +1961,7 @@ void init_researches()
         BUILDING_GRANARY_UPGRADE_ARROWTOWER_FOOD, 0,
         BUILDING_GRANARY_UPGRADE_ARROWTOWER_STONE, 0, 0, 0, 0, 0);
 
-    // 攻防类（仓库）：两级科技（一级 → 二级）
-    add("工具使用", BUILDING_STOCK, BUILDING_STOCK_UPGRADE_USETOOL, 2,
-        BUILDING_STOCK_UPGRADE_CLOSER_ATTACK_FOOD, 0, 0, 0,
-        BUILDING_STOCK_UPGRADE_CLOSER_ATTACK_2_FOOD, 0, 0,
-        BUILDING_STOCK_UPGRADE_CLOSER_ATTACK_2_GOLD);
-    add("步兵护甲", BUILDING_STOCK, BUILDING_STOCK_UPGRADE_DEFENSE_INFANTRY, 2,
-        BUILDING_STOCK_UPGRADE_DEFENSE_INFANTRY_FOOD, 0, 0, 0,
-        BUILDING_STOCK_UPGRADE_DEFENSE_INFANTRY_2_FOOD, 0, 0,
-        BUILDING_STOCK_UPGRADE_DEFENSE_INFANTRY_2_GOLD);
+    // 弓兵护甲：两级科技。
     add("弓兵护甲", BUILDING_STOCK, BUILDING_STOCK_UPGRADE_DEFENSE_ARCHER, 2,
         BUILDING_STOCK_UPGRADE_DEFENSE_ARCHER_FOOD, 0, 0, 0,
         BUILDING_STOCK_UPGRADE_DEFENSE_ARCHER_2_FOOD, 0, 0,
