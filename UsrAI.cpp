@@ -223,7 +223,11 @@ static int siegePositionFrame = -1000000;
 struct SiegePositionSample { double dr, ur; int blood; };
 static std::unordered_map<int, SiegePositionSample> siegePositionSamples;
 static std::unordered_map<int, std::string> siegeOrderReason;
-static std::unordered_map<int,int> siegeLastBlood, siegeFleeUntil;
+static std::unordered_map<int,int> siegeLastBlood, siegeFleeUntil, siegeAttackId;
+struct SiegeDiagOrder { int id, sn, target, frame; };
+static std::vector<SiegeDiagOrder> siegeDiagOrders;
+static std::unordered_map<int, std::string> siegeDiagContext;
+
 static int    siegePriestStuckFrame = 0;  // 转化阶段的祭司卡住检测
 static double siegePriestStuckDR = 0, siegePriestStuckUR = 0;
 static int    weakKillFrame = 0;          // 自裁弱兵的上次执行帧
@@ -606,6 +610,73 @@ void UsrAI::processData()
     btCtx.info = &info;
 
     btRoot->tick(btCtx);
+
+    auto repairActionSubject = [&](instruction &cur) {
+        if (cur.type != INS_HUMANACTION || cur.self != nullptr) return;
+        if (cur.SN < 0) return;
+        // 仅构造取主体，不提交移动，也不改变攻击目标和指令编号。
+        const instruction probe(INS_HUMANMOVE, cur.SN, Double::Zero(), Double::Zero());
+        cur.self = probe.self;
+        DebugText(std::string("单位指令修复: SN=") + std::to_string(cur.SN)
+            + " id=" + std::to_string(cur.id) + " 目标=" + std::to_string(cur.obSN)
+            + " 空主体已补=" + std::to_string(cur.self != nullptr));
+    };
+    for (instruction &cur : InsPerFrame) repairActionSubject(cur);
+    UsrIns.lock.lock();
+    const size_t pendingCount = UsrIns.instructions.size();
+    for (size_t i = 0; i < pendingCount; ++i) {
+        instruction cur = UsrIns.instructions.front(); UsrIns.instructions.pop();
+        repairActionSubject(cur); UsrIns.instructions.push(cur);
+    }
+    UsrIns.lock.unlock();
+
+    // 同时检查直接入队与基类暂存两种提交路径，兼容 OJ 的接口实现。
+    if (!siegeDiagOrders.empty() && siegeDiagOrders.back().frame == info.GameFrame) {
+        UsrIns.lock.lock();
+        auto pending = UsrIns.instructions;
+        UsrIns.lock.unlock();
+        const int sharedQueueSize = (int)pending.size();
+        const int bufferedQueueSize = (int)InsPerFrame.size();
+        for (const instruction &cur : InsPerFrame) pending.push(cur);
+        std::unordered_map<int, instruction> last;
+        std::unordered_map<int, int> count;
+        std::set<int> presentIds, objects;
+        const int queueSize = (int)pending.size();
+        while (!pending.empty()) {
+            const instruction cur = pending.front(); pending.pop();
+            presentIds.insert(cur.id);
+            if (cur.self != nullptr) objects.insert(cur.SN);
+            for (const tagArmy &a : info.armies) {
+                if (a.Sort != AT_STONE_THROWER || a.SN != cur.SN) continue;
+                last[cur.SN] = cur; ++count[cur.SN]; break;
+            }
+        }
+        for (const SiegeDiagOrder &order : siegeDiagOrders) {
+            if (order.frame != info.GameFrame) continue;
+            const auto found = last.find(order.sn);
+            std::string details = " 无同单位指令";
+            if (found != last.end()) {
+                const instruction &cur = found->second;
+                const bool attacking = cur.type == INS_HUMANACTION;
+                const int rank = (int)std::distance(objects.begin(), objects.lower_bound(cur.SN)) + 1;
+                details = " 同单位条数=" + std::to_string(count[cur.SN])
+                    + " 最后id=" + std::to_string(cur.id) + " 最后类型=" + std::to_string(cur.type)
+                    + " 最后目标=" + (attacking ? std::to_string(cur.obSN) : "非攻击")
+                    + " 主体非空=" + std::to_string(cur.self != nullptr)
+                    + " 主体匹配=" + std::to_string(cur.self == g_Object[cur.SN])
+                    + " 目标非空=" + (attacking ? std::to_string(cur.obj != nullptr) : "不适用")
+                    + " 目标匹配=" + (attacking ? std::to_string(cur.obSN >= 0 && cur.obj == g_Object[cur.obSN]) : "不适用")
+                    + " 去重后序位=" + std::to_string(rank);
+            }
+            DebugText(std::string("投石车队列核对: SN=") + std::to_string(order.sn)
+                + " 请求id=" + std::to_string(order.id)
+                + " 仍在队列=" + std::to_string(presentIds.count(order.id))
+                + " 共享队列=" + std::to_string(sharedQueueSize)
+                + " 基类暂存=" + std::to_string(bufferedQueueSize)
+                + " 队列总数=" + std::to_string(queueSize)
+                + " 有效主体数=" + std::to_string(objects.size()) + details);
+        }
+    }
 }
 
 // 建筑建造模块
@@ -683,7 +754,7 @@ void bt_sync()
         assaultFocusTower = -1; bowTowerMoveTarget.clear(); gatherBlockedUntil.clear();
         assaultPriestFlee = false; assaultPriestSafeFrame = 0; assaultPriestBlood = -1;
         unitNeedsRecovery.clear();
-        siegePositionFrame = -1000000; siegePositionSamples.clear(); siegeOrderReason.clear(); siegeLastBlood.clear(); siegeFleeUntil.clear();
+        siegePositionFrame = -1000000; siegePositionSamples.clear(); siegeOrderReason.clear(); siegeLastBlood.clear(); siegeFleeUntil.clear(); siegeAttackId.clear(); siegeDiagOrders.clear(); siegeDiagContext.clear();
         defenseDiagOrders.clear(); defenseDiagBlood.clear();
         defenseDiagFrame = -1000000;
         assaultState = 0; assaultStageFrame = 0;
@@ -701,6 +772,17 @@ void bt_sync()
         baitScoutReason = "待选";
     }
     lastSeenGameFrame = info.GameFrame;
+
+    for (auto it = siegeDiagOrders.begin(); it != siegeDiagOrders.end();) {
+        const auto ret = info.ins_ret.find(it->id);
+        const bool timeout = (info.GameFrame - it->frame) * std::max(1, TimePerFrame) >= 2000;
+        if (ret == info.ins_ret.end() && !timeout) { ++it; continue; }
+        DebugText(std::string("投石车回执: SN=") + std::to_string(it->sn)
+            + " id=" + std::to_string(it->id) + " 目标=" + std::to_string(it->target)
+            + " ret=" + (ret == info.ins_ret.end() ? "未收到(2s)" : std::to_string(ret->second))
+            + " 延迟ms=" + std::to_string((info.GameFrame - it->frame) * std::max(1, TimePerFrame)));
+        it = siegeDiagOrders.erase(it);
+    }
 
     for (auto it = defenseDiagOrders.begin(); it != defenseDiagOrders.end();) {
         const auto ret = info.ins_ret.find(it->id);
@@ -2903,6 +2985,17 @@ static double siege_path_risk(double x, double y, int ignoredTower)
     return risk;
 }
 
+static int siege_diag_order(int id, int sn, int target, double dr, double ur)
+{
+    siegeDiagOrders.push_back({id, sn, target, info.GameFrame});
+    DebugText(std::string("投石车下令: SN=") + std::to_string(sn)
+        + " id=" + std::to_string(id) + " 类型=" + (target >= 0 ? "攻击" : "移动/停止")
+        + " 目标=" + std::to_string(target)
+        + " 落点=(" + std::to_string(dr / BLOCKSIDELENGTH) + "," + std::to_string(ur / BLOCKSIDELENGTH) + ")"
+        + " 原因=" + siegeOrderReason[sn]);
+    return id;
+}
+
 static bool siege_safe_step(tagArmy &a, double goalDR, double goalUR, int ignoredTower, bool fleeing)
 {
     const double bsl = BLOCKSIDELENGTH;
@@ -2911,14 +3004,16 @@ static bool siege_safe_step(tagArmy &a, double goalDR, double goalUR, int ignore
     const double initialRisk = siege_path_risk(a.DR, a.UR, ignoredTower);
     if (a.NowState == HUMAN_STATE_WALKING && !unitNeedsRecovery.count(a.SN)
         && info.GameFrame - unitStepFrame[a.SN] < 800 / tpf
-        && siege_path_risk(a.DR0, a.UR0, ignoredTower) <= initialRisk + 0.01) return true;
+        && (!fleeing || siege_path_risk(a.DR0, a.UR0, ignoredTower) <= initialRisk + 0.01)) return true;
     if (info.GameFrame - unitStepFrame[a.SN] < RANGED_STEP_GAP) return false;
     const int origin = a.BlockDR * 505 + a.BlockUR;
     std::vector<int> queue(1, origin);
     std::unordered_map<int,int> parent;
     parent[origin] = origin;
+    std::unordered_map<int,double> pathRisk;
+    pathRisk[origin] = initialRisk;
     int bestKey = origin;
-    double best = (fleeing ? initialRisk * 1000 * bsl : 0)
+    double best = (fleeing ? initialRisk * 1000 * bsl : initialRisk * 0.25 * bsl)
         + calDistance(a.DR, a.UR, goalDR, goalUR);
     const int dx[4] = {1,-1,0,0}, dy[4] = {0,0,1,-1};
     for (size_t head = 0; head < queue.size() && head < 6000; ++head) {
@@ -2926,7 +3021,8 @@ static bool siege_safe_step(tagArmy &a, double goalDR, double goalUR, int ignore
         const double x = (bx + 0.5) * bsl, y = (by + 0.5) * bsl;
         const double risk = key == origin ? initialRisk : siege_path_risk(x, y, ignoredTower);
         if (key != origin && landing_ok(bx, by, a.SN)) {
-            const double score = (fleeing ? risk * 1000 * bsl : 0) + calDistance(x, y, goalDR, goalUR);
+            const double score = (fleeing ? risk * 1000 * bsl : pathRisk[key] * 0.25 * bsl)
+                + calDistance(x, y, goalDR, goalUR);
             if (score < best - 0.1 * bsl) { best = score; bestKey = key; }
         }
         for (int k = 0; k < 4; ++k) {
@@ -2935,7 +3031,8 @@ static bool siege_safe_step(tagArmy &a, double goalDR, double goalUR, int ignore
             const int next = nx * 505 + ny;
             if (parent.count(next)) continue;
             const double nextRisk = siege_path_risk((nx + 0.5) * bsl, (ny + 0.5) * bsl, ignoredTower);
-            if (nextRisk > risk + 0.01) continue;
+            if (fleeing && nextRisk > risk + 0.01) continue;
+            pathRisk[next] = std::max(pathRisk[key], nextRisk);
             parent[next] = key; queue.push_back(next);
         }
     }
@@ -2943,7 +3040,8 @@ static bool siege_safe_step(tagArmy &a, double goalDR, double goalUR, int ignore
     int waypoint = bestKey;
     while (parent[waypoint] != origin) waypoint = parent[waypoint];
     const int bx = waypoint / 505, by = waypoint % 505;
-    HumanMove(a.SN, (bx + 0.5) * bsl, (by + 0.5) * bsl);
+    siege_diag_order(HumanMove(a.SN, (bx + 0.5) * bsl, (by + 0.5) * bsl),
+        a.SN, -1, (bx + 0.5) * bsl, (by + 0.5) * bsl);
     attackOrderSN[a.SN] = -12; unitStepFrame[a.SN] = info.GameFrame;
     unitNeedsRecovery.erase(a.SN); cellClaim[(bx << 12) | by] = a.SN;
     return true;
@@ -3134,15 +3232,17 @@ void demand_attack()
         if (fieldUnits >= ASSAULT_ROLLBACK_MIN && committed) {   // 真冒出一队 → 先打人
             assaultState = 2;
             assaultStageFrame = info.GameFrame;
-        } else if (towerCnt == 0) {
+        } else if (towerCnt <= 2 && haveBase && enemySiegeSN >= 0
+                   && info.enemy_armies.empty() && enemy_remains() == 0) {
             const bool waited = (info.GameFrame - assaultStageFrame
                                  > ASSAULT_HUNTER_WAIT_MS / toFrames);
-            if (enemyHunters == 0 || waited) {
+            if (enemyHunters == 0 || (towerCnt == 0 && waited)) {
+                DebugText(std::string("提前转化: 敌兵清空，剩塔=") + std::to_string(towerCnt));
                 assaultState = 4;              // 猎手清完（或等到放弃）→ 祭司进场
                 assaultStageFrame = info.GameFrame;
             }
         }
-    } else if (assaultState == 4 && towerCnt > 0) {
+    } else if (assaultState == 4 && towerCnt > 2) {
         assaultState = 3;                      // 又看到塔（新探索到的）→ 回去拆
         assaultStageFrame = info.GameFrame;
     }
@@ -3310,6 +3410,16 @@ void demand_attack()
 
     if (assaultState >= 2 && info.GameFrame - siegePositionFrame >= std::max(1, 2000 / toFrames)) {
         siegePositionFrame = info.GameFrame;
+        for (auto it = siegePositionSamples.begin(); it != siegePositionSamples.end();) {
+            bool alive = false;
+            for (const tagArmy &a : info.armies) if (a.SN == it->first) { alive = true; break; }
+            if (alive) { ++it; continue; }
+            DebugText(std::string("投石车消失: SN=") + std::to_string(it->first)
+                + " 最后坐标=(" + std::to_string(it->second.dr / bsl) + "," + std::to_string(it->second.ur / bsl) + ")"
+                + " 最后血=" + std::to_string(it->second.blood)
+                + " 最后原因=" + siegeOrderReason[it->first] + " 最后判定=" + siegeDiagContext[it->first]);
+            it = siegePositionSamples.erase(it);
+        }
         for (const tagArmy &a : info.armies) {
             if (!army_is_siege(a.Sort)) continue;
             const auto old = siegePositionSamples.find(a.SN);
@@ -3323,6 +3433,8 @@ void demand_attack()
                 + ") 距终点=" + std::to_string(calDistance(a.DR, a.UR, a.DR0, a.UR0) / bsl)
                 + " 血=" + std::to_string(a.Blood) + " 血变化=" + std::to_string(hpDelta)
                 + " 状态=" + std::to_string(a.NowState) + " 目标=" + std::to_string(a.WorkObjectSN)
+                + " 阶段=" + std::to_string(assaultState) + " 集火塔=" + std::to_string(assaultFocusTower)
+                + " 上帧判定=" + siegeDiagContext[a.SN]
                 + " 原因=" + (siegeOrderReason.count(a.SN) ? siegeOrderReason[a.SN] : "尚未下令")
                 + " 指令目标=" + (attackOrderSN.count(a.SN) ? std::to_string(attackOrderSN[a.SN]) : "无")
                 + " 移动距今ms=" + std::to_string((info.GameFrame - unitStepFrame[a.SN]) * toFrames)
@@ -3415,11 +3527,13 @@ void demand_attack()
             if (locked || d < (hunter ? PRIEST_HUNTER_RESUME_DIST : own_attack_range(e.Sort) + 4))
                 safe = false;
         }
-        if (assaultPriestBlood >= 0 && priest->Blood < assaultPriestBlood) danger = true;
+        const bool forcingFactory = assaultState == 4 && towerCnt <= 2;
+        if (!forcingFactory && assaultPriestBlood >= 0 && priest->Blood < assaultPriestBlood) danger = true;
         assaultPriestBlood = priest->Blood;
-        if (point_in_enemy_tower_range(priest->DR, priest->UR, TOWER_SAFE_MARGIN)) {
+        if (!forcingFactory && point_in_enemy_tower_range(priest->DR, priest->UR, TOWER_SAFE_MARGIN)) {
             danger = true; safe = false;
         }
+        if (forcingFactory && !danger) assaultPriestFlee = false;
         if (danger) { assaultPriestFlee = true; assaultPriestSafeFrame = 0; }
         if (assaultPriestFlee) {
             if (!safe) assaultPriestSafeFrame = 0;
@@ -3553,19 +3667,23 @@ void demand_attack()
                     bool clearOrder = (code == -1 || code == -2 || code == -4
                                        || code == -6 || code == -7 || code == -9 || code == -10 || code == -12);
                     if (code >= 0) {
-                        // 目标还在吗？离我们多远？
-                        double d = -1.0;
-                        for (tagArmy &e : info.enemy_armies)
-                            if (e.SN == code) { d = calDistance(a.DR, a.UR, e.DR, e.UR); break; }
+                        double d = -1.0, targetHeight = assault_height(a.BlockDR, a.BlockUR);
+                        for (const tagArmy &e : info.enemy_armies)
+                            if (e.SN == code) {
+                                d = std::max(fabs(a.DR - e.DR), fabs(a.UR - e.UR));
+                                targetHeight = assault_height(e.BlockDR, e.BlockUR); break;
+                            }
                         if (d < 0)
-                            for (tagBuilding &e : info.enemy_buildings)
+                            for (const tagBuilding &e : info.enemy_buildings)
                                 if (e.SN == code) {
-                                    d = calDistance(a.DR, a.UR,
-                                                    e.BlockDR * bsl, e.BlockUR * bsl);
-                                    break;
+                                    const double x = (e.BlockDR + building_size(e.Type) * 0.5) * bsl;
+                                    const double y = (e.BlockUR + building_size(e.Type) * 0.5) * bsl;
+                                    d = std::max(fabs(a.DR - x), fabs(a.UR - y));
+                                    targetHeight = assault_height(e.BlockDR, e.BlockUR); break;
                                 }
-                        if (d < 0)             clearOrder = true;   // 目标没了（死了/雾了）
-                        else if (d > (own_attack_range(a.Sort) + 0.5) * bsl) clearOrder = true; // 还没够着却不动 = 卡住
+                        const double range = own_attack_range(a.Sort)
+                            + std::max(0.0, assault_height(a.BlockDR, a.BlockUR) - targetHeight);
+                        if (d < 0 || d > (range + 0.5) * bsl) clearOrder = true;
                     }
                     if (clearOrder) {
                         attackOrderSN.erase(a.SN);
@@ -3586,7 +3704,7 @@ void demand_attack()
             wantSN = pickEnemy(a, true, false, ASSAULT_STAGE_GUARD_DIST, archer);
         } else if (assaultState == 2) {
             wantSN = pickEnemy(a, false, false, ASSAULT_ENGAGE_DIST, archer);
-        } else if (assaultState == 3) {
+        } else if (assaultState == 3 || assaultState == 4) {
             // 状态 3 = 野战军已清完 → **全军齐射**当前集火的那座箭塔：
             // 先看这轮还有没有敌方单位（工厂可能又出新兵），有就先打人；
             // 没有就所有人一起打 focusTower（全队打同一座：集合火力、拆得快）。
@@ -3598,7 +3716,7 @@ void demand_attack()
             wantSN = pickEnemy(a, false, true, ASSAULT_ENGAGE_DIST, archer);
         }
 
-        if (assaultState == 3 && archer && wantSN == focusTower && haveHome
+        if ((assaultState == 3 || assaultState == 4) && archer && wantSN == focusTower && haveHome
             && bow_attack_home_side(a, focusTower, homeDR, homeUR)) continue;
 
         if (army_is_siege(a.Sort)) {
@@ -3621,10 +3739,19 @@ void demand_attack()
             const double minRange = static_cast<double>(DIS_MIN_STONE_THROWER) * bsl;
             const double targetDist = std::max(fabs(a.DR - targetDR), fabs(a.UR - targetUR));
             const double targetMinDist = calDistance(a.DR, a.UR, targetDR, targetUR);
+            siegeDiagContext[a.SN] = "目标=" + std::to_string(wantSN)
+                + " 可见=" + std::to_string(targetVisible)
+                + " 坐标=(" + std::to_string(targetDR / bsl) + "," + std::to_string(targetUR / bsl) + ")"
+                + " 距离=" + std::to_string(targetDist / bsl)
+                + " 最小距=" + std::to_string(targetMinDist / bsl)
+                + " 射程=[" + std::to_string(minRange / bsl) + "," + std::to_string(range / bsl) + "]"
+                + " 恢复=" + std::to_string(unitNeedsRecovery.count(a.SN))
+                + " 风险=" + std::to_string(siege_path_risk(a.DR, a.UR, -1));
             const auto previousBlood = siegeLastBlood.find(a.SN);
             const bool hurt = previousBlood != siegeLastBlood.end() && a.Blood < previousBlood->second;
             siegeLastBlood[a.SN] = a.Blood;
             const bool closeEnemy = enemy_near(a.DR, a.UR, 4 * bsl);
+            siegeDiagContext[a.SN] += " 掉血=" + std::to_string(hurt) + " 近敌=" + std::to_string(closeEnemy);
             if (hurt || closeEnemy) siegeFleeUntil[a.SN] = info.GameFrame + 4000 / std::max(1, TimePerFrame);
             if (siegeFleeUntil.count(a.SN) && info.GameFrame < siegeFleeUntil[a.SN]) {
                 siegeOrderReason[a.SN] = "受伤或近敌，沿低威胁路径撤离";
@@ -3633,18 +3760,37 @@ void demand_attack()
                 if (!siege_safe_step(a, escapeDR, escapeUR, -1, true)
                     && a.NowState != HUMAN_STATE_IDLE
                     && info.GameFrame - unitStepFrame[a.SN] >= RANGED_STEP_GAP) {
-                    HumanMove(a.SN, a.DR, a.UR); attackOrderSN[a.SN] = -12;
+                    siege_diag_order(HumanMove(a.SN, a.DR, a.UR), a.SN, -1, a.DR, a.UR); attackOrderSN[a.SN] = -12;
                     unitStepFrame[a.SN] = info.GameFrame;
                     siegeOrderReason[a.SN] = "撤离暂时无路，停止追击等待";
                 }
                 continue;
             }
+            bool attackRejected = false;
+            const auto pendingAttack = siegeAttackId.find(a.SN);
+            if (pendingAttack != siegeAttackId.end()) {
+                const auto receipt = info.ins_ret.find(pendingAttack->second);
+                if (receipt != info.ins_ret.end()) {
+                    attackRejected = receipt->second != ACTION_SUCCESS;
+                    siegeAttackId.erase(pendingAttack);
+                    if (attackRejected) unitNeedsRecovery[a.SN] = info.GameFrame;
+                }
+            }
+            const int attackGap = std::max(RANGED_FIRE_GAP, 1000 / std::max(1, TimePerFrame));
+            auto fireSiege = [&]() {
+                if (unitFireFrame.count(a.SN)
+                    && info.GameFrame - unitFireFrame[a.SN] < attackGap) return;
+                siegeAttackId[a.SN] = siege_diag_order(HumanAction(a.SN, wantSN),
+                    a.SN, wantSN, targetDR, targetUR);
+                unitFireFrame[a.SN] = info.GameFrame;
+                attackOrderSN[a.SN] = wantSN;
+                unitNeedsRecovery.erase(a.SN);
+            };
             if (targetVisible && a.WorkObjectSN == wantSN
                 && targetMinDist >= minRange && targetDist <= range
                 && a.NowState != HUMAN_STATE_IDLE) {
                 siegeOrderReason[a.SN] = "保留有效射击位，不追随远端补兵";
-                attackOrderSN[a.SN] = wantSN;
-                unitNeedsRecovery.erase(a.SN);
+                if (unitNeedsRecovery.count(a.SN)) fireSiege();
                 continue;
             }
             double bowDR = 0, bowUR = 0; int bowCount = 0;
@@ -3667,6 +3813,9 @@ void demand_attack()
                 if (ul > 1e-6) {
                     ux /= ul; uy /= ul;
                     const double behind = (bowDR - a.DR) * ux + (bowUR - a.UR) * uy;
+                    siegeDiagContext[a.SN] += " 前排人数=" + std::to_string(bowCount)
+                        + " 前排=(" + std::to_string(bowDR / bsl) + "," + std::to_string(bowUR / bsl) + ")"
+                        + " 落后格=" + std::to_string(behind / bsl);
                     const bool firing = a.NowState == HUMAN_STATE_ATTACKING
                         && a.WorkObjectSN == wantSN;
                     // 开火至少落后弓兵 2 格；正在攻击时保留 1 格余量，减少边界抖动。
@@ -3676,10 +3825,7 @@ void demand_attack()
                         siegeOrderReason[a.SN] = "位于弓兵后排，保持攻击";
                         if (a.WorkObjectSN != wantSN || a.NowState == HUMAN_STATE_IDLE
                             || unitNeedsRecovery.count(a.SN)) {
-                            HumanAction(a.SN, wantSN);
-                            unitFireFrame[a.SN] = info.GameFrame;
-                            attackOrderSN[a.SN] = wantSN;
-                            unitNeedsRecovery.erase(a.SN);
+                            fireSiege();
                         }
                         continue;
                     }
@@ -3702,7 +3848,11 @@ void demand_attack()
                             double score = calDistance(gx, gy, rearDR, rearUR);
                             if (targetVisible) {
                                 if (calDistance(gx, gy, targetDR, targetUR) < minRange) continue;
-                                if (d > range) score += 20 * bsl + 4 * (d - range);
+                                const double candidateRange = std::min(static_cast<double>(VISION_STONE_THROWER),
+                                    own_attack_range(a.Sort) + std::max(0,
+                                        assault_height(bx, by)
+                                        - assault_height((int)(targetDR / bsl), (int)(targetUR / bsl)))) * bsl;
+                                if (d > candidateRange) score += 20 * bsl + 4 * (d - candidateRange);
                             }
                             if (score < best) { best = score; mbx = bx; mby = by; }
                         }
@@ -3717,7 +3867,7 @@ void demand_attack()
                                 if (!landing_ok(bx, by, a.SN) || !spread_cell_reachable(bx, by)) continue;
                                 const double gx = (bx + 0.5) * bsl, gy = (by + 0.5) * bsl;
                                 if ((bowDR - gx) * ux + (bowUR - gy) * uy < SIEGE_BACK_DIST * bsl) continue;
-                                if ((assaultState != 3 && point_in_enemy_tower_range(gx, gy, TOWER_SAFE_MARGIN))
+                                if ((assaultState != 3 && assaultState != 4 && point_in_enemy_tower_range(gx, gy, TOWER_SAFE_MARGIN))
                                     || enemy_near(gx, gy, 4 * bsl)) continue;
                                 const double score = calDistance(gx, gy, rearDR, rearUR);
                                 if (score < localBest - 0.25 * bsl) {
@@ -3727,6 +3877,7 @@ void demand_attack()
                         }
                         if (mbx < 0) siegeOrderReason[a.SN] = "远端及局部后排均无可用落点";
                     }
+                    siegeDiagContext[a.SN] += " 后排落点=(" + std::to_string(mbx) + "," + std::to_string(mby) + ")";
                     if (mbx >= 0) {
                         const double gx = (mbx + 0.5) * bsl, gy = (mby + 0.5) * bsl;
                         const bool sameMove = a.NowState == HUMAN_STATE_WALKING
@@ -3734,9 +3885,9 @@ void demand_attack()
                         if ((!sameMove || unitNeedsRecovery.count(a.SN))
                             && (a.NowState == HUMAN_STATE_ATTACKING
                                 || calDistance(a.DR, a.UR, gx, gy) > 0.5 * bsl)) {
-                            const int ignoredTower = assaultState == 3 && wantSN == focusTower ? focusTower : -1;
+                            const int ignoredTower = (assaultState == 3 || assaultState == 4) && wantSN == focusTower ? focusTower : -1;
                             if (!siege_safe_step(a, gx, gy, ignoredTower, false))
-                                siegeOrderReason[a.SN] = "后排路径威胁过高，保持位置";
+                                siegeOrderReason[a.SN] = "后排寻路未找到有效推进点，保持位置";
                         }
                         cellClaim[(mbx << 12) | mby] = a.SN;
                     }
@@ -3745,7 +3896,7 @@ void demand_attack()
             }
             siegeOrderReason[a.SN] = "无有效弓兵前排，保持位置";
             if (a.NowState != HUMAN_STATE_IDLE && attackOrderSN[a.SN] != -11) {
-                HumanMove(a.SN, a.DR, a.UR);
+                siege_diag_order(HumanMove(a.SN, a.DR, a.UR), a.SN, -1, a.DR, a.UR);
                 attackOrderSN[a.SN] = -11; unitStepFrame[a.SN] = info.GameFrame;
             }
             continue;
@@ -3914,7 +4065,8 @@ void demand_attack()
                 const double gy = std::max(centerUR - workDist + 1.0,
                     std::min(centerUR + workDist - 1.0, (by + 0.5) * bsl));
                 if ((int)(gx / bsl) != bx || (int)(gy / bsl) != by) continue;
-                if (point_in_enemy_tower_range(gx, gy, TOWER_SAFE_MARGIN) || enemy_near(gx, gy, 8 * bsl)) continue;
+                if ((towerCnt > 2 && point_in_enemy_tower_range(gx, gy, TOWER_SAFE_MARGIN))
+                    || enemy_near(gx, gy, 8 * bsl)) continue;
                 bool hunterNear = false;
                 for (const tagArmy &e : info.enemy_armies)
                     if (assault_priest_hunter(e.Sort)
