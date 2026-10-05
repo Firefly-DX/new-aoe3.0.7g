@@ -153,6 +153,14 @@ static std::unordered_map<int,int> towerTargetSN;  // 箭塔 SN → 已下达的
 static int towerOrderFrame = 0;                    // 上次对箭塔下令的帧号
 static int lastTowerFocusSN = -1;                  // 上次下达的集火目标 SN
 static int towerAggroFrame = 0;                    // 当前集火目标"开始被箭塔打"的帧号
+struct DefenseDiagOrder {
+    int id, sn, target, frame;
+    bool priest;
+};
+static std::vector<DefenseDiagOrder> defenseDiagOrders;
+static std::unordered_map<int,int> defenseDiagBlood;
+static int defenseDiagFrame = -1000000;
+
 // ---- 修塔（前两波打完之后派 1 个村民去修最惨的那座塔）----
 static int repairFarmerSN   = -1;        // 正在负责修理的村民（-1 = 还没派）
 static int repairTargetSN   = -1;        // 正在修理的建筑 SN
@@ -206,6 +214,7 @@ static int    weakKillFrame = 0;          // 自裁弱兵的上次执行帧
 static int    weakKillSN = -1;
 static std::unordered_map<int,int> unitStuckKey;    // 单位 SN → 上次采样的位置（打包）
 static std::unordered_map<int,int> unitStuckFrame;  // 单位 SN → 上次采样的帧号
+static std::unordered_map<int,int> unitNeedsRecovery;
 static std::unordered_map<int,int> unitStepFrame;
 static std::unordered_map<int,int> unitFireFrame;
 // 单位 SN 非 0 = 这个弓箭手正在“脱离接触”（拉扯的滞回状态，见 kite_archer_step）。
@@ -652,6 +661,9 @@ void bt_sync()
 {
     static int lastSeenGameFrame = 0;
     if (info.GameFrame < lastSeenGameFrame) {
+        unitNeedsRecovery.clear();
+        defenseDiagOrders.clear(); defenseDiagBlood.clear();
+        defenseDiagFrame = -1000000;
         assaultState = 0; assaultStageFrame = 0;
         enemyClearSinceFrame = 0;
         baitScoutSN = -1; baitScoutReturning = false; baitScoutSwitchFrame = 0;
@@ -667,6 +679,18 @@ void bt_sync()
         baitScoutReason = "待选";
     }
     lastSeenGameFrame = info.GameFrame;
+
+    for (auto it = defenseDiagOrders.begin(); it != defenseDiagOrders.end();) {
+        const auto ret = info.ins_ret.find(it->id);
+        const bool timeout = info.GameFrame - it->frame >= 2000 / TimePerFrame;
+        if (ret == info.ins_ret.end() && !timeout) { ++it; continue; }
+        DebugText(std::string("守家诊断回执: 类型=") + (it->priest ? "转化" : "塔攻击")
+            + " id=" + std::to_string(it->id) + " SN=" + std::to_string(it->sn)
+            + " 目标=" + std::to_string(it->target)
+            + " ret=" + (ret == info.ins_ret.end() ? std::string("未收到(2s)") : std::to_string(ret->second))
+            + " 延迟帧=" + std::to_string(info.GameFrame - it->frame));
+        it = defenseDiagOrders.erase(it);
+    }
 
     if (info.civilizationStage < CIVILIZATION_BRONZEAGE) {
         phase = 1;   // 开局即工具时代，直接冲铜器
@@ -2237,6 +2261,9 @@ static bool landing_ok(int bx, int by, int selfSN)
     return true;
 }
 
+static bool prepare_unit_reach(const tagArmy &a);
+static bool spread_cell_reachable(int bx, int by);
+
 static bool kite_retreat_home(tagArmy &a)
 {
     double hDR = 0, hUR = 0;
@@ -2251,11 +2278,21 @@ static bool kite_retreat_home(tagArmy &a)
 
     const int tx = cx + (int)lround(dx * KITE_RETREAT_STEP);
     const int ty = cy + (int)lround(dy * KITE_RETREAT_STEP);
-    int destX = tx, destY = ty;
-    if (!landing_ok(destX, destY, a.SN)
-        && !(find_free_spot_near(tx, ty, 1, 6, destX, destY)
-             && landing_ok(destX, destY, a.SN)))
-        return false;                               // 找不到空位：本帧不动
+    if (!prepare_unit_reach(a)) return false;
+    int destX = -1, destY = -1; double best = 1e18;
+    for (int bx = tx - 6; bx <= tx + 6; ++bx) {
+        for (int by = ty - 6; by <= ty + 6; ++by) {
+            if (!landing_ok(bx, by, a.SN) || !spread_cell_reachable(bx, by)) continue;
+            if (bx == cx && by == cy) continue;
+            const double score = calDistance(bx, by, tx, ty);
+            if (score < best) { best = score; destX = bx; destY = by; }
+        }
+    }
+    if (destX < 0) return false;
+    if (a.NowState == HUMAN_STATE_WALKING && !unitNeedsRecovery.count(a.SN)
+        && calDistance(a.DR0, a.UR0, (destX + 0.5) * bsl, (destY + 0.5) * bsl) <= bsl)
+        return true;
+    unitNeedsRecovery.erase(a.SN);
     unitStepFrame[a.SN] = info.GameFrame;
     cellClaim[(destX << 12) | destY] = a.SN;
     HumanMove(a.SN, (destX + 0.5) * bsl, (destY + 0.5) * bsl);
@@ -2277,9 +2314,10 @@ static bool kite_archer_step(tagArmy &a, int wantSN)
     // 下攻击指令的**唯一出口**：onlyIfInReach = 退不了时才要求“已在自己射程内”
     auto shoot = [&](bool onlyIfInReach) {
         if (wantSN < 0 || (a.WorkObjectSN == wantSN
-            && a.NowState != HUMAN_STATE_IDLE)) return;
+            && a.NowState != HUMAN_STATE_IDLE && !unitNeedsRecovery.count(a.SN))) return;
         if (info.GameFrame - unitFireFrame[a.SN] < RANGED_FIRE_GAP) return;
         if (onlyIfInReach && td > reach) return;
+        unitNeedsRecovery.erase(a.SN);
         attackOrderSN[a.SN] = wantSN;
         HumanAction(a.SN, wantSN);
         unitFireFrame[a.SN] = info.GameFrame;
@@ -2296,6 +2334,42 @@ static bool kite_archer_step(tagArmy &a, int wantSN)
     }
     // 没目标：身边还有敌人（< 自己射程+3）就**别跟着推进**（否则是往敌人怀里走）
     if (wantSN < 0) return nd < resume;
+    if (a.NowState == HUMAN_STATE_WALKING && attackOrderSN.count(a.SN)
+        && attackOrderSN[a.SN] == -9 && !unitNeedsRecovery.count(a.SN)
+        && info.GameFrame - unitStepFrame[a.SN] < 3000 / TimePerFrame)
+        return true;
+    if (unitNeedsRecovery.count(a.SN) && prepare_unit_reach(a)) {
+        double targetDR = 0, targetUR = 0; bool found = false;
+        for (const tagArmy &e : info.enemy_armies)
+            if (e.SN == wantSN) { targetDR = e.DR; targetUR = e.UR; found = true; break; }
+        for (const tagBuilding &e : info.enemy_buildings)
+            if (e.SN == wantSN) {
+                targetDR = e.BlockDR * BLOCKSIDELENGTH;
+                targetUR = e.BlockUR * BLOCKSIDELENGTH; found = true; break;
+            }
+        const double bsl = BLOCKSIDELENGTH;
+        if (found && calDistance(a.DR, a.UR, targetDR, targetUR) > reach * bsl) {
+            int bxBest = -1, byBest = -1; double best = 1e18;
+            for (int dx = -4; dx <= 4; ++dx) {
+                for (int dy = -4; dy <= 4; ++dy) {
+                    const int bx = a.BlockDR + dx, by = a.BlockUR + dy;
+                    if (dx * dx + dy * dy < 2) continue;
+                    if (!landing_ok(bx, by, a.SN) || !spread_cell_reachable(bx, by)) continue;
+                    const double score = calDistance((bx + 0.5) * bsl, (by + 0.5) * bsl,
+                                                       targetDR, targetUR);
+                    if (score < best) { best = score; bxBest = bx; byBest = by; }
+                }
+            }
+            if (bxBest >= 0) {
+                HumanMove(a.SN, (bxBest + 0.5) * bsl, (byBest + 0.5) * bsl);
+                unitStepFrame[a.SN] = info.GameFrame;
+                unitNeedsRecovery.erase(a.SN);
+                attackOrderSN[a.SN] = -9;
+                cellClaim[(bxBest << 12) | byBest] = a.SN;
+                return true;
+            }
+        }
+    }
     shoot(false);                            // 有目标：交给内核走过去开火
     return true;
 }
@@ -2334,6 +2408,18 @@ static bool reach_bfs(int sx, int sy)
     return reachQueue.size() > 1;        // 一步都走不出去 ⇒ 这个起点的位图不可信
 }
 
+static bool prepare_unit_reach(const tagArmy &a)
+{
+    static int frame = -1, stamp = -1;
+    if (a.BlockDR < 0 || a.BlockUR < 0 || a.BlockDR >= 505 || a.BlockUR >= 505)
+        return false;
+    if (frame == info.GameFrame && stamp == reachCur
+        && reachStamp[a.BlockDR][a.BlockUR] == reachCur) return true;
+    const bool ready = reach_bfs(a.BlockDR, a.BlockUR);
+    frame = info.GameFrame; stamp = reachCur;
+    return ready;
+}
+
 static bool spread_cell_reachable(int bx, int by)
 {
     if (bx < 0 || by < 0 || bx >= 505 || by >= 505) return false;
@@ -2345,9 +2431,11 @@ static bool spread_slot(int cx, int cy, int half, int sn, int &bx, int &by)
     // 本帧第一次调用时，从阵位中心做一次可达性洪水填充（同帧复用）
     static int spreadReachFrame = -1000000;
     static bool spreadReachReady = false;
-    if (spreadReachFrame != info.GameFrame) {
+    static int spreadReachStamp = -1;
+    if (spreadReachFrame != info.GameFrame || spreadReachStamp != reachCur) {
         spreadReachFrame = info.GameFrame;
         spreadReachReady = reach_bfs(cx, cy);
+        spreadReachStamp = reachCur;
     }
 
     int slot = 0;
@@ -3145,7 +3233,7 @@ void demand_attack()
                     std::unordered_map<int,int>::iterator itO = attackOrderSN.find(a.SN);
                     const int code = (itO != attackOrderSN.end()) ? itO->second : -3;
                     bool clearOrder = (code == -1 || code == -2 || code == -4
-                                       || code == -6 || code == -7);
+                                       || code == -6 || code == -7 || code == -9);
                     if (code >= 0) {
                         // 目标还在吗？离我们多远？
                         double d = -1.0;
@@ -3159,9 +3247,12 @@ void demand_attack()
                                     break;
                                 }
                         if (d < 0)             clearOrder = true;   // 目标没了（死了/雾了）
-                        else if (d > 12.0 * bsl) clearOrder = true; // 还没够着却不动 = 卡住
+                        else if (d > (own_attack_range(a.Sort) + 0.5) * bsl) clearOrder = true; // 还没够着却不动 = 卡住
                     }
-                    if (clearOrder) attackOrderSN.erase(a.SN);   // 下一帧重新下令（=重新寻路）
+                    if (clearOrder) {
+                        attackOrderSN.erase(a.SN);
+                        unitNeedsRecovery[a.SN] = 1;
+                    }   // 下一帧重新下令（=重新寻路）
                 }
                 unitStuckKey[a.SN] = posKey;
                 unitStuckFrame[a.SN] = info.GameFrame;
@@ -3190,74 +3281,87 @@ void demand_attack()
         }
 
         if (army_is_siege(a.Sort)) {
+            double targetDR = tx, targetUR = ty;
+            bool targetVisible = false;
+            for (const tagArmy &e : info.enemy_armies) {
+                if (e.SN != wantSN) continue;
+                targetDR = e.DR; targetUR = e.UR; targetVisible = true; break;
+            }
+            for (const tagBuilding &e : info.enemy_buildings) {
+                if (e.SN != wantSN) continue;
+                targetDR = e.BlockDR * bsl; targetUR = e.BlockUR * bsl;
+                targetVisible = true; break;
+            }
+            const double range = own_attack_range(a.Sort) * bsl;
+            const double minRange = static_cast<double>(DIS_MIN_STONE_THROWER) * bsl;
+            const double targetDist = calDistance(a.DR, a.UR, targetDR, targetUR);
             double bowDR = 0, bowUR = 0; int bowCount = 0;
+            double nearestBow = 1e18;
             for (const tagArmy &o : info.armies) {
                 if (o.SN == baitScoutSN || o.SN == weakKillSN) continue;
                 if (o.Sort != AT_BOWMAN && o.Sort != AT_COMPOSITE_BOWMAN) continue;
+                nearestBow = std::min(nearestBow, calDistance(o.DR, o.UR, targetDR, targetUR));
+            }
+            for (const tagArmy &o : info.armies) {
+                if (o.SN == baitScoutSN || o.SN == weakKillSN) continue;
+                if (o.Sort != AT_BOWMAN && o.Sort != AT_COMPOSITE_BOWMAN) continue;
+                if (calDistance(o.DR, o.UR, targetDR, targetUR) > nearestBow + 3 * bsl) continue;
                 bowDR += o.DR; bowUR += o.UR; ++bowCount;
             }
             if (bowCount > 0) {
                 bowDR /= bowCount; bowUR /= bowCount;
-                double targetDR = tx, targetUR = ty;
-                bool targetVisible = false;
-                for (const tagArmy &e : info.enemy_armies) {
-                    if (e.SN != wantSN) continue;
-                    targetDR = e.DR; targetUR = e.UR; targetVisible = true; break;
-                }
-                for (const tagBuilding &e : info.enemy_buildings) {
-                    if (e.SN != wantSN) continue;
-                    targetDR = e.BlockDR * bsl; targetUR = e.BlockUR * bsl;
-                    targetVisible = true; break;
-                }
                 double ux = targetDR - bowDR, uy = targetUR - bowUR;
-                double ul = sqrt(ux * ux + uy * uy);
-                if (ul < 1e-6 && haveHome) {
-                    ux = bowDR - homeDR; uy = bowUR - homeUR;
-                    ul = sqrt(ux * ux + uy * uy);
-                }
+                const double ul = sqrt(ux * ux + uy * uy);
                 if (ul > 1e-6) {
                     ux /= ul; uy /= ul;
                     const double behind = (bowDR - a.DR) * ux + (bowUR - a.UR) * uy;
-                    const double range = own_attack_range(a.Sort) * bsl;
-                    // 攻击命令会自动追击；只允许已在弓兵后方、射程内的投石车开火。
-                    if (behind >= bsl && targetVisible
-                        && calDistance(a.DR, a.UR, targetDR, targetUR) <= range) {
-                        if (a.WorkObjectSN != wantSN || a.NowState != HUMAN_STATE_ATTACKING) {
+                    const bool firing = a.NowState == HUMAN_STATE_ATTACKING
+                        && a.WorkObjectSN == wantSN;
+                    // 开火至少落后弓兵 2 格；正在攻击时保留 1 格余量，减少边界抖动。
+                    const double fireBack = (firing ? 1.0 : (double)SIEGE_BACK_DIST) * bsl;
+                    if (behind >= fireBack && targetVisible
+                        && targetDist >= minRange && targetDist <= range) {
+                        if (a.WorkObjectSN != wantSN || a.NowState == HUMAN_STATE_IDLE
+                            || unitNeedsRecovery.count(a.SN)) {
                             HumanAction(a.SN, wantSN);
                             attackOrderSN[a.SN] = wantSN;
+                            unitNeedsRecovery.erase(a.SN);
                         }
                         continue;
                     }
                     const double rearDR = bowDR - ux * SIEGE_BACK_DIST * bsl;
                     const double rearUR = bowUR - uy * SIEGE_BACK_DIST * bsl;
-                    const bool oldAttack = a.NowState == HUMAN_STATE_ATTACKING;
-                    if (!oldAttack && info.GameFrame - unitStepFrame[a.SN] < RANGED_STEP_GAP)
-                        continue;
+                    if (info.GameFrame - unitStepFrame[a.SN] < RANGED_STEP_GAP) continue;
+                    if (!prepare_unit_reach(a)) continue;
                     const int cx = (int)(rearDR / bsl), cy = (int)(rearUR / bsl);
                     int mbx = -1, mby = -1; double best = 1e18;
-                    for (int dx = -3; dx <= 3; ++dx) {
-                        for (int dy = -3; dy <= 3; ++dy) {
+                    for (int dx = -6; dx <= 6; ++dx) {
+                        for (int dy = -6; dy <= 6; ++dy) {
                             const int bx = cx + dx, by = cy + dy;
                             const double gx = (bx + 0.5) * bsl, gy = (by + 0.5) * bsl;
-                            if ((bowDR - gx) * ux + (bowUR - gy) * uy < SIEGE_BACK_DIST * bsl)
-                                continue;
-                            if (!landing_ok(bx, by, a.SN)) continue;
+                            const double behind = (bowDR - gx) * ux + (bowUR - gy) * uy;
+                            if (behind < SIEGE_BACK_DIST * bsl) continue;
+                            if (!landing_ok(bx, by, a.SN) || !spread_cell_reachable(bx, by)) continue;
+                            const double d = calDistance(gx, gy, targetDR, targetUR);
                             double score = calDistance(gx, gy, rearDR, rearUR);
-                            if (targetVisible && calDistance(gx, gy, targetDR, targetUR) > range)
-                                score += 10 * bsl;
+                            if (targetVisible) {
+                                if (d < minRange) continue;
+                                if (d > range) score += 20 * bsl + 4 * (d - range);
+                            }
                             if (score < best) { best = score; mbx = bx; mby = by; }
                         }
                     }
                     if (mbx >= 0) {
                         const double gx = (mbx + 0.5) * bsl, gy = (mby + 0.5) * bsl;
-                        const bool staleMove = a.NowState == HUMAN_STATE_WALKING
-                            && calDistance(a.DR0, a.UR0, gx, gy) > bsl;
-                        if (oldAttack || staleMove
-                            || (a.NowState != HUMAN_STATE_WALKING
-                                && calDistance(a.DR, a.UR, gx, gy) > bsl)) {
+                        const bool sameMove = a.NowState == HUMAN_STATE_WALKING
+                            && calDistance(a.DR0, a.UR0, gx, gy) <= bsl;
+                        if ((!sameMove || unitNeedsRecovery.count(a.SN))
+                            && (a.NowState == HUMAN_STATE_ATTACKING
+                                || calDistance(a.DR, a.UR, gx, gy) > 0.5 * bsl)) {
                             HumanMove(a.SN, gx, gy);
                             unitStepFrame[a.SN] = info.GameFrame;
                             attackOrderSN[a.SN] = -6;
+                            unitNeedsRecovery.erase(a.SN);
                         }
                         cellClaim[(mbx << 12) | mby] = a.SN;
                     }
@@ -4986,6 +5090,7 @@ void combat_tactic()
         bool needOrder = (towerFocusSN != lastTowerFocusSN)
                       || (info.GameFrame - towerOrderFrame >= refresh);
         if (needOrder) {
+            const bool focusChanged = towerFocusSN != lastTowerFocusSN;
             if (towerFocusSN != lastTowerFocusSN)
                 towerAggroFrame = info.GameFrame;   // 换了新集火目标：重新计拉仇恨时间
             lastTowerFocusSN = towerFocusSN;
@@ -4994,7 +5099,12 @@ void combat_tactic()
                 if (tower.Type != BUILDING_ARROWTOWER) continue;
                 if (tower.Percent < 100) continue;
                 towerTargetSN[tower.SN] = towerFocusSN;
-                HumanAction(tower.SN, towerFocusSN);
+                const int diagId = HumanAction(tower.SN, towerFocusSN);
+                defenseDiagOrders.push_back({diagId, tower.SN, towerFocusSN, info.GameFrame, false});
+                DebugText(std::string("守家诊断下令: 塔=") + std::to_string(tower.SN)
+                    + " 目标=" + std::to_string(towerFocusSN) + " id=" + std::to_string(diagId)
+                    + " 快照Project=" + std::to_string(tower.Project)
+                    + " 原因=" + (focusChanged ? "换目标" : "2s刷新"));
             }
         }
     }
@@ -5020,6 +5130,53 @@ void combat_tactic()
                                          ax * BLOCKSIDELENGTH,
                                          ay * BLOCKSIDELENGTH)
                              <= PRIEST_ENGAGE_RADIUS * BLOCKSIDELENGTH);
+    }
+
+    if (info.GameFrame - defenseDiagFrame >= 5000 / TimePerFrame) {
+        defenseDiagFrame = info.GameFrame;
+        DebugText(std::string("守家诊断快照: 帧=") + std::to_string(info.GameFrame)
+            + " 阶段=" + std::to_string(phase) + " 时代=" + std::to_string(info.civilizationStage)
+            + " 石库存=" + std::to_string((int)info.Stone)
+            + " 塔科技=" + std::to_string(arrowTowerResearched)
+            + " 塔目标数=" + std::to_string(arrowTowerTarget)
+            + " 待建塔=" + std::to_string(active_build(BUILDING_ARROWTOWER))
+            + " 集火=" + std::to_string(towerFocusSN)
+            + " 有塔=" + std::to_string(hasTower) + " 仇恨就绪=" + std::to_string(aggroReady)
+            + " 祭司到位=" + std::to_string(priestEngaged));
+        if (priest != nullptr)
+            DebugText(std::string("守家诊断祭司: SN=") + std::to_string(priest->SN)
+                + " 血=" + std::to_string(priest->Blood) + " 状态=" + std::to_string(priest->NowState)
+                + " 冷却=" + std::to_string(priest->ConvertCooldown)
+                + " Work=" + std::to_string(priest->WorkObjectSN)
+                + " 转化记录=" + std::to_string(convertTargetSN)
+                + " 位置=" + std::to_string(priest->BlockDR) + "," + std::to_string(priest->BlockUR));
+        for (const tagBuilding &tower : info.buildings) {
+            if (tower.Type != BUILDING_ARROWTOWER) continue;
+            DebugText(std::string("守家诊断塔: SN=") + std::to_string(tower.SN)
+                + " 血=" + std::to_string(tower.Blood) + " 完成=" + std::to_string(tower.Percent)
+                + " Project=" + std::to_string(tower.Project)
+                + " 位置=" + std::to_string(tower.BlockDR) + "," + std::to_string(tower.BlockUR));
+        }
+        std::unordered_map<int,int> nextBlood;
+        for (const tagArmy &e : info.enemy_armies) {
+            double towerDist = -1;
+            for (const tagBuilding &tower : info.buildings) {
+                if (tower.Type != BUILDING_ARROWTOWER || tower.Percent < 100) continue;
+                const double d = calDistance(e.DR, e.UR, tower.BlockDR * BLOCKSIDELENGTH,
+                                              tower.BlockUR * BLOCKSIDELENGTH) / BLOCKSIDELENGTH;
+                if (towerDist < 0 || d < towerDist) towerDist = d;
+            }
+            const auto old = defenseDiagBlood.find(e.SN);
+            DebugText(std::string("守家诊断敌兵: SN=") + std::to_string(e.SN)
+                + " 兵种=" + std::to_string(e.Sort) + " 血=" + std::to_string(e.Blood)
+                + " 掉血=" + (old == defenseDiagBlood.end() ? std::string("首次") : std::to_string(old->second - e.Blood))
+                + " 状态=" + std::to_string(e.NowState) + " Work=" + std::to_string(e.WorkObjectSN)
+                + " 最近塔距=" + std::to_string(towerDist)
+                + " 祭司距=" + std::to_string(priest == nullptr ? -1.0 :
+                    calDistance(e.DR, e.UR, priest->DR, priest->UR) / BLOCKSIDELENGTH));
+            nextBlood[e.SN] = e.Blood;
+        }
+        defenseDiagBlood.swap(nextBlood);
     }
 
     if (priest != nullptr && priest->ConvertCooldown == 0 && priestEngaged && aggroReady) {
@@ -5090,7 +5247,10 @@ void combat_tactic()
             convertStuckFrame = info.GameFrame;
             convertStuckDR = priest->DR;
             convertStuckUR = priest->UR;
-            HumanAction(priest->SN, target);
+            const int diagId = HumanAction(priest->SN, target);
+            defenseDiagOrders.push_back({diagId, priest->SN, target, info.GameFrame, true});
+            DebugText(std::string("守家诊断下令: 祭司=") + std::to_string(priest->SN)
+                + " 目标=" + std::to_string(target) + " id=" + std::to_string(diagId));
         }
     }
 
