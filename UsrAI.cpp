@@ -44,6 +44,7 @@ struct Task {
 
     int resourceType = -1;    // 采集：目标资源类型
     int targetSN = -1;        // 已锁定资源/敌人 SN
+    int goldAnchorSN = -1;
     bool granaryFarm = false; // 反攻新增农田，仅在谷仓周围选址
     int buildingType = -1;    // 建造/生产：建筑类型
     int blockDR = -1, blockUR = -1; // 建造位置
@@ -125,7 +126,9 @@ static double scoutCheckDR = -1, scoutCheckUR = -1;
 static int scoutUnitCheckFrame = 0;                  // 上次卡住检查的帧号（侦察兵）
 static double scoutUnitCheckDR = -1, scoutUnitCheckUR = -1;
 static int scoutUnitOrderFrame = 0;                  // 侦察兵移动指令上次下达帧（节流）
-static bool scoutEverMade = false;   // 是否已经有过侦察兵（全局只造一个）
+static int scoutBowSN = -1;
+static bool scoutAssigned = false;
+static bool army_is_scout(const tagArmy &a) { return a.Sort == AT_SCOUT || a.SN == scoutBowSN; }
 static double scoutLastDR = 0, scoutLastUR = 0;      // 侦察兵最后已知位置
 static bool scoutSeenAlive = false;                  // 已见到活着的侦察兵
 static bool scoutDeathPending = false;               // 阵亡位置等待反攻阶段使用
@@ -294,6 +297,13 @@ static void demand_produce();
 static void demand_repair();
 static void demand_gather();
 static int resource_type_by_sn(int sn);
+static bool gather_target_reachable(const tagFarmer &f, int sn, int bx, int by, int size);
+static std::set<int> goldCluster;
+static int goldAnchorSN = -1, goldClusterFrame = -1000000;
+static int gold_worker_count();
+static bool selected_gold(int sn);
+static void update_gold_cluster();
+static void rebalance_gold_workers();
 static void demand_army();
 static void init_researches();
 static void request_research(ResearchState &r);
@@ -573,10 +583,6 @@ static const int PHASE3_POP_TARGET = 50;
 
 static const int POP_TARGET_EARLY = 28;
 
-static const int SCOUT_UNITS = 1;
-
-static const int SCOUT_BUILD_MIN = 12;
-
 static const int GATHER_PER_RESOURCE_MAX = 3;
 
 static const int GATHER_MAX_DIST = 35;
@@ -762,7 +768,8 @@ void bt_sync()
         baitScoutSN = -1; baitScoutReturning = false; baitScoutSwitchFrame = 0;
         baitScoutBlood = -1; baitScoutBack = false; slowPushValid = false;
         lastAdvanceDR = -1; lastAdvanceUR = -1;
-        granaryFarmSites.clear();
+        granaryFarmSites.clear(); goldCluster.clear(); goldAnchorSN = -1; goldClusterFrame = -1000000;
+        scoutBowSN = -1; scoutAssigned = false;
         scoutSeenAlive = false; scoutDeathPending = false;
         scoutLastDR = 0; scoutLastUR = 0;
         enemyFarFound = false; enemyFarDR = 0; enemyFarUR = 0;
@@ -805,6 +812,15 @@ void bt_sync()
     }
 
     // 全程跟踪侦察兵；敌营定位只在反攻阶段使用。
+    if (phase >= 3 && !scoutAssigned) {
+        for (const tagArmy &a : info.armies) {
+            if (a.Sort != AT_BOWMAN || a.SN == weakKillSN) continue;
+            scoutBowSN = a.SN; scoutAssigned = true;
+            DebugText(std::string("弓兵探图: 指定普通弓兵 SN=") + std::to_string(a.SN));
+            break;
+        }
+    }
+    update_gold_cluster();
     record_enemy_positions();
     update_enemy_ledger();
 
@@ -831,9 +847,17 @@ void bt_sync()
         farmTarget = farmerNum / FARM_PER_POP;
         if (phase >= 3) {
             farmTarget = FARM_TARGET_LATE + GRANARY_FARM_EXTRA;
+        } else if (phase >= 2) {
+            const long long elapsedMs = (long long)info.GameFrame * std::max(1, TimePerFrame);
+            int cap = FARM_CAP_BRONZE;
+            if (elapsedMs >= 13LL * 60000) cap = 7;
+            else if (elapsedMs >= 12LL * 60000) cap = 6;
+            else if (elapsedMs >= 10LL * 60000) cap = 5;
+            if (elapsedMs >= 10LL * 60000)
+                farmTarget = std::min(cap, std::max(0, farmerNum - 9));
+            else if (farmTarget > cap) farmTarget = cap;
         } else {
-            const int cap = (phase >= 2) ? FARM_CAP_BRONZE : FARM_CAP_TOOL;
-            if (farmTarget > cap) farmTarget = cap;
+            if (farmTarget > FARM_CAP_TOOL) farmTarget = FARM_CAP_TOOL;
         }
         if (farmTarget > FARM_MAX) farmTarget = FARM_MAX;
     }
@@ -1117,6 +1141,74 @@ bool center_free()
 }
 
 // ---------- 建造需求 ----------
+static bool selected_gold(int sn) { return goldCluster.count(sn) != 0; }
+
+static int gold_worker_count()
+{
+    std::set<int> workers;
+    for (const tagFarmer &f : info.farmers)
+        if (f.FarmerSort == FARMERTYPE_FARMER && resource_type_by_sn(f.WorkObjectSN) == RESOURCE_GOLD)
+            workers.insert(f.SN);
+    for (const Task &t : taskQueue)
+        if (t.type == TASK_GATHER && t.resourceType == RESOURCE_GOLD
+            && t.state == TASK_ASSIGNED && t.farmerSN >= 0) workers.insert(t.farmerSN);
+    return (int)workers.size();
+}
+
+static void update_gold_cluster()
+{
+    if (phase < 2 || info.GameFrame - goldClusterFrame < 2000 / std::max(1, TimePerFrame)) return;
+    goldClusterFrame = info.GameFrame;
+    std::vector<const tagResource*> mines;
+    for (const tagResource &r : info.resources)
+        if (r.Type == RESOURCE_GOLD && r.Cnt > 0) mines.push_back(&r);
+    auto usable = [&](const tagResource &r) {
+        if (res_too_far(r.Type, r.BlockDR, r.BlockUR)
+            || gather_spot_dangerous(r.DR, r.UR, gather_danger_radius(r.Type))
+            || res_stand_spots(r.SN) <= 0) return false;
+        for (const tagFarmer &f : info.farmers)
+            if (f.FarmerSort == FARMERTYPE_FARMER
+                && gather_target_reachable(f, r.SN, r.BlockDR, r.BlockUR, 1)) return true;
+        return false;
+    };
+    for (const tagResource *r : mines)
+        if (selected_gold(r->SN) && usable(*r)) return;
+    goldCluster.clear(); goldAnchorSN = -1;
+    std::set<int> visited;
+    double best = 1e18, homeDR = 0, homeUR = 0;
+    home_center(homeDR, homeUR);
+    for (const tagResource *seed : mines) {
+        if (visited.count(seed->SN)) continue;
+        std::vector<const tagResource*> group(1, seed); visited.insert(seed->SN);
+        for (size_t i = 0; i < group.size(); ++i)
+            for (const tagResource *r : mines)
+                if (!visited.count(r->SN) && calDistance(group[i]->DR, group[i]->UR, r->DR, r->UR)
+                    <= 4 * BLOCKSIDELENGTH) { visited.insert(r->SN); group.push_back(r); }
+        int gatherSlots = 0, amount = 0;
+        const tagResource *anchor = nullptr; double homeDist = 1e18, warehouseDist = 1e18;
+        for (const tagResource *r : group) {
+            if (!usable(*r)) continue;
+            gatherSlots += std::min(3, res_stand_spots(r->SN)); amount += r->Cnt;
+            const double d = calDistance(homeDR, homeUR, r->DR, r->UR);
+            if (d < homeDist) { homeDist = d; anchor = r; }
+            for (const tagBuilding &b : info.buildings)
+                if (b.Type == BUILDING_STOCK && b.Percent >= 100)
+                    warehouseDist = std::min(warehouseDist, calDistance(r->DR, r->UR,
+                        (b.BlockDR + 1.5) * BLOCKSIDELENGTH, (b.BlockUR + 1.5) * BLOCKSIDELENGTH));
+        }
+        if (!anchor) continue;
+        const double score = (gatherSlots < 3 ? 10000 : 0)
+            + (warehouseDist > 7 * BLOCKSIDELENGTH ? 1000 : 0)
+            + homeDist / BLOCKSIDELENGTH - std::min(amount, 10000) * 0.001;
+        if (score >= best) continue;
+        best = score; goldCluster.clear();
+        for (const tagResource *r : group) goldCluster.insert(r->SN);
+        goldAnchorSN = anchor->SN;
+    }
+    DebugText(std::string("采金矿群: 锚点=") + std::to_string(goldAnchorSN)
+        + " 矿块数=" + std::to_string(goldCluster.size()) + " 人数上限=3");
+}
+
 void demand_build()
 {
     int woodBudget = info.Wood;
@@ -1149,8 +1241,7 @@ void demand_build()
         }
     }
 
-    // ---- 冲铜器建筑链：谷仓 → 市场 → 兵营 → 靶场 → 马厩 ----
-    // 靶场/马厩既能让"工具时代建筑数 ≥ 2"满足升级条件，又提供远程与机动兵种
+    // 冲铜器建筑链：谷仓 → 市场 → 兵营 → 靶场。
     if (phase < 2) {
         struct BuildNeed { int type; int wood; };
         const BuildNeed chain[] = {
@@ -1158,7 +1249,6 @@ void demand_build()
             { BUILDING_MARKET,   BUILD_MARKET_WOOD   },
             { BUILDING_ARMYCAMP, BUILD_ARMYCAMP_WOOD },
             { BUILDING_RANGE,    BUILD_RANGE_WOOD    },
-            { BUILDING_STABLE,   BUILD_STABLE_WOOD   },
         };
         for (const BuildNeed &n : chain) {
             // 要按"已排队但还没建成的花费"预留，否则同一帧排出的几个建筑
@@ -1176,16 +1266,7 @@ void demand_build()
             }
         }
     } else {
-        // 铜器时代：补齐马厩（骑兵前置，也是升铜器三选一之一）
-        //   用 optionalWood：新增靶场比马厩重要（第三阶段不造骑兵了）。
-        if (count_done(BUILDING_STABLE) == 0 && active_build(BUILDING_STABLE) == 0
-            && optionalWood >= pending_build_wood() + BUILD_STABLE_WOOD) {
-            Task t;
-            t.id = nextTaskId++; t.type = TASK_BUILD; t.priority = 2;
-            t.buildingType = BUILDING_STABLE;
-            taskQueue.push_back(t);
-        }
-        else if (phase >= 3
+        if (phase >= 3
             && count_done(BUILDING_RANGE) + active_build(BUILDING_RANGE) < RANGE_MAX
             && woodBudget >= pending_build_wood() + BUILD_RANGE_WOOD) {
             Task t;
@@ -1202,18 +1283,19 @@ void demand_build()
     for (const Task &t : taskQueue)
         if (t.type == TASK_BUILD && t.buildingType == BUILDING_FARM && t.granaryFarm
             && t.state != TASK_DONE && t.state != TASK_FAILED) ++extraPending;
-    const int baseTarget = (phase >= 3) ? FARM_TARGET_LATE : farmTarget;
+    const int baseTarget = std::min(farmTarget, FARM_TARGET_LATE);
     const int baseFarms = count_done(BUILDING_FARM) - extraFarms;
     const int basePending = active_build(BUILDING_FARM) - extraPending;
-    if (baseFarms + basePending < baseTarget
+    if (baseFarms + basePending < baseTarget && active_build(BUILDING_FARM) == 0
         && optionalWood >= pending_build_wood() + BUILD_FARM_WOOD + 50) {
         Task t;
         t.id = nextTaskId++; t.type = TASK_BUILD; t.priority = 2;
         t.buildingType = BUILDING_FARM;
         taskQueue.push_back(t);
     }
-    if (phase >= 3 && farmTarget > 0 && count_done(BUILDING_GRANARY) > 0
-        && extraFarms + extraPending < GRANARY_FARM_EXTRA
+    if (phase >= 3 && farmTarget > FARM_TARGET_LATE && count_done(BUILDING_GRANARY) > 0
+        && active_build(BUILDING_FARM) == 0
+        && extraFarms + extraPending < std::min(GRANARY_FARM_EXTRA, farmTarget - FARM_TARGET_LATE)
         && optionalWood >= pending_build_wood() + BUILD_FARM_WOOD + 50) {
         Task t;
         t.id = nextTaskId++; t.type = TASK_BUILD; t.priority = 2;
@@ -1224,7 +1306,6 @@ void demand_build()
     // ---- 升级铜器时代 ----
     if (phase < 2) {
         int tool = count_done(BUILDING_MARKET)
-                 + count_done(BUILDING_STABLE)
                  + count_done(BUILDING_RANGE);
         if (tool >= 2 && info.Meat >= BUILDING_CENTER_UPGRADE_BRONZEAGE_FOOD
             && center_free()
@@ -1280,6 +1361,25 @@ void demand_build()
         }
     }
 
+
+    if (phase >= 2 && goldAnchorSN >= 0 && gold_needed()
+        && active_build(BUILDING_STOCK) == 0
+        && woodBudget >= pending_build_wood() + BUILD_STOCK_WOOD) {
+        bool nearby = false;
+        for (const tagResource &r : info.resources) {
+            if (!selected_gold(r.SN)) continue;
+            for (const tagBuilding &b : info.buildings)
+                if (b.Type == BUILDING_STOCK && calDistance(r.DR, r.UR,
+                    (b.BlockDR + 1.5) * BLOCKSIDELENGTH, (b.BlockUR + 1.5) * BLOCKSIDELENGTH)
+                    <= 7 * BLOCKSIDELENGTH) nearby = true;
+        }
+        if (!nearby) {
+            Task t; t.id = nextTaskId++; t.type = TASK_BUILD; t.priority = 2;
+            t.buildingType = BUILDING_STOCK; t.goldAnchorSN = goldAnchorSN;
+            taskQueue.push_back(t);
+            DebugText(std::string("矿群补仓库: 锚点=") + std::to_string(goldAnchorSN));
+        }
+    }
 }
 // 资源点 (dr,ur) 到"最近的可用存放建筑"的距离。
 double nearest_dropoff_dist(int resType, double dr, double ur)
@@ -1481,8 +1581,7 @@ void demand_gather()
 
     int wantGold = 0;
     if (gold_needed() && has_resource(RESOURCE_GOLD)) {
-        wantGold = rushing_composite_bowman() ? 2 : 1;
-        if (info.Gold + 100 < gold_demand()) wantGold = 3;
+        wantGold = 3;
         const int goldCap = total / 3;
         if (goldCap >= 1 && wantGold > goldCap) wantGold = goldCap;
     }
@@ -1656,7 +1755,7 @@ void demand_gather()
             if (fallbackTypes[k] == RESOURCE_BUSH && (!berryPhase || foodFarmOnly))
                 continue;   // 浆果阶段已结束 / 14:00 后不再采浆果
             if (fallbackTypes[k] == RESOURCE_STONE && !needStone) continue;
-            if (fallbackTypes[k] == RESOURCE_GOLD  && wantGold == 0) continue;
+            if (fallbackTypes[k] == RESOURCE_GOLD && (wantGold == 0 || gold_worker_count() >= 3)) continue;
             if (!has_resource(fallbackTypes[k])) continue;
             int allow = spare;
             if (fallbackTypes[k] == RESOURCE_TREE) {
@@ -1665,6 +1764,7 @@ void demand_gather()
                 if (left == 0) break;
                 if (allow > left) allow = left;
             }
+            if (fallbackTypes[k] == RESOURCE_GOLD) allow = std::min(allow, std::max(0, 3 - gold_worker_count()));
             for (int i = 0; i < allow; i++) {
                 Task t;
                 t.id = nextTaskId++; t.type = TASK_GATHER; t.priority = 5;
@@ -1726,7 +1826,8 @@ void demand_gather()
                         continue;   // 浆果阶段结束 / 14:00 后不再采浆果
                     // 需求为零的资源不当候选（“后期石头太多”：塔建满、石堆成山还去挖）
                     if (r.Type == RESOURCE_STONE && !needStone) continue;
-                    if (r.Type == RESOURCE_GOLD  && wantGold == 0) continue;
+                    if (r.Type == RESOURCE_GOLD
+                        && (wantGold == 0 || gold_worker_count() >= 3 || !selected_gold(r.SN))) continue;
                     if (res_too_far(r.Type, r.BlockDR, r.BlockUR)) continue;   // 太远：不采
                     if (gather_spot_dangerous(r.DR, r.UR, gather_danger_radius(r.Type))) continue;   // 危险：不派
                     int spots = res_stand_spots(r.SN);
@@ -1767,6 +1868,11 @@ void demand_gather()
                 // 与 assign_tasks / 兜底 1 抢人：派活是异步的，内核此刻还说他是 IDLE，
                 // 不记一下的话下一帧 assign_tasks 会再给他派一个采集任务、把这条顶掉。
                 mark_farmer_order(f.SN);
+                if (resource_type_by_sn(pick) == RESOURCE_GOLD) {
+                    Task t; t.id = nextTaskId++; t.type = TASK_GATHER; t.priority = 3;
+                    t.resourceType = RESOURCE_GOLD; t.targetSN = pick; t.farmerSN = f.SN;
+                    t.state = TASK_ASSIGNED; t.startFrame = info.GameFrame; taskQueue.push_back(t);
+                }
                 sentNow[pick]++;
                 if (pickIsTree) --woodLeft;   // 占掉一个伐木名额
             }
@@ -1808,19 +1914,17 @@ void demand_gather()
 // ---------- 第二阶段：造兵需求 ----------
 void demand_army()
 {
-    int bowman = 0, composite = 0, scout = 0, totalArmy = 0;
+    int bowman = 0, composite = 0, totalArmy = 0;
     bool weakKillAlive = false;            // weakKillSN 还在吗（见它的说明）
     for (tagArmy &a : info.armies) {
         if (a.SN == weakKillSN) weakKillAlive = true;
         if (a.Sort == AT_PRIEST) continue;
-        if (a.Sort == AT_SCOUT) { scout++; continue; }
+        if (army_is_scout(a)) continue;
         totalArmy++;
         if (a.Sort == AT_COMPOSITE_BOWMAN) composite++;
         if (a.Sort == AT_BOWMAN || a.Sort == AT_COMPOSITE_BOWMAN
             || a.Sort == AT_SLINGER) bowman++;
     }
-
-    if (scout > 0) scoutEverMade = true;
 
     // 自裁标记的清理：那个兵已经死了（自裁成功/阵亡）就把标记清掉，
     // 否则 demand_attack 会永远跳过这个 SN。
@@ -1844,6 +1948,7 @@ void demand_army()
             if (info.GameFrame - weakKillFrame >= interval) {
                 int weakSN = -1;
                 for (tagArmy &a : info.armies) {
+                    if (army_is_scout(a)) continue;
                     if (a.Sort == AT_CLUBMAN || a.Sort == AT_SLINGER) {
                         weakSN = a.SN; break;
                     }
@@ -1857,17 +1962,6 @@ void demand_army()
             }
         }
         return;   // 人口已满：下面那些造兵都排不进去
-    }
-
-    // ---- 侦察兵：专职探路。速度 4.07，是祭司（2.24）的 1.8 倍；
-    if (!scoutEverMade && scout < SCOUT_UNITS
-        && phase >= 2
-        && info.GameFrame >= (int)(SCOUT_BUILD_MIN * 60 * 1000.0 / TimePerFrame)) {
-        tagBuilding *st0 = free_building(BUILDING_STABLE);
-        if (st0 && info.Meat >= BUILDING_STABLE_CREATE_SCOUT_FOOD) {
-            BuildingAction(st0->SN, BUILDING_STABLE_CREATE_SCOUT);
-            return;
-        }
     }
 
     if (phase < 2) return;   // 铜器时代前不打仗，只留上面那个侦察兵
@@ -2233,7 +2327,7 @@ void record_enemy_positions()
     // 己方军队不受迷雾过滤；由出现后消失确认阵亡，保留最后可取得的位置。
     bool scoutAlive = false;
     for (const tagArmy &a : info.armies) {
-        if (a.Sort != AT_SCOUT) continue;
+        if (!army_is_scout(a)) continue;
         scoutAlive = true;
         scoutLastDR = a.DR;
         scoutLastUR = a.UR;
@@ -2523,7 +2617,7 @@ static bool spread_slot(int cx, int cy, int half, int sn, int &bx, int &by)
 
     int slot = 0;
     for (tagArmy &o : info.armies) {
-        if (o.Sort == AT_PRIEST || o.Sort == AT_SCOUT) continue;
+        if (o.Sort == AT_PRIEST || army_is_scout(o)) continue;
         if (o.SN < sn) slot++;
     }
 
@@ -2826,7 +2920,7 @@ void army_standby()
     cellClaim.clear();
 
     for (tagArmy &a : info.armies) {
-        if (a.Sort == AT_PRIEST || a.Sort == AT_SCOUT) continue;  // 祭司守家、侦察兵探路
+        if (a.Sort == AT_PRIEST || army_is_scout(a)) continue;  // 祭司守家、侦察兵探路
         if (a.NowState != HUMAN_STATE_IDLE) continue;             // 走路/交战都不打扰
 
         // 已经进到待命区里 → 不再下指令。
@@ -3105,7 +3199,7 @@ void demand_attack()
     // ---- 2) 兵力统计（祭司、侦察兵都不算战斗兵）----
     int composite = 0, siegeCnt = 0, totalArmy = 0;
     for (tagArmy &a : info.armies) {
-        if (a.Sort == AT_PRIEST || a.Sort == AT_SCOUT) continue;
+        if (a.Sort == AT_PRIEST || army_is_scout(a)) continue;
         totalArmy++;
         if (a.Sort == AT_COMPOSITE_BOWMAN) composite++;
         if (army_is_siege(a.Sort))  siegeCnt++;
@@ -3163,7 +3257,7 @@ void demand_attack()
     const double fieldRadius = (ASSAULT_ENGAGE_DIST + 6) * bsl;
     auto threatensUs = [&](double dr, double ur) -> bool {
         for (tagArmy &a : info.armies) {
-            if (a.Sort == AT_PRIEST || a.Sort == AT_SCOUT) continue;
+            if (a.Sort == AT_PRIEST || army_is_scout(a)) continue;
             if (calDistance(dr, ur, a.DR, a.UR) < fieldRadius) return true;
         }
         return false;
@@ -3260,7 +3354,7 @@ void demand_attack()
         if (!slowPushValid) {
             double sumDR = 0, sumUR = 0; int count = 0;
             for (const tagArmy &a : info.armies) {
-                if (a.Sort == AT_PRIEST || a.Sort == AT_SCOUT || a.SN == weakKillSN) continue;
+                if (a.Sort == AT_PRIEST || army_is_scout(a) || a.SN == weakKillSN) continue;
                 sumDR += a.DR; sumUR += a.UR; ++count;
             }
             if (count > 0) {
@@ -3285,7 +3379,7 @@ void demand_attack()
             double brD = 1e18, bfD = 1e18;
             for (tagArmy &a : info.armies) {
                 if (a.SN == weakKillSN) continue;
-                if (a.Sort == AT_PRIEST || a.Sort == AT_SCOUT) continue;
+                if (a.Sort == AT_PRIEST || army_is_scout(a)) continue;
                 const double d = calDistance(a.DR, a.UR, tx, ty);
                 if ((a.Sort == AT_COMPOSITE_BOWMAN || a.Sort == AT_BOWMAN) && d < brD) {
                     brD = d; bestRanged = a.SN;
@@ -3540,8 +3634,8 @@ void demand_attack()
         // 最靠前的我方战斗兵（诱饵/自裁兵不算：诱饵本来就主动前压）
         double lineFrontDist = 1e18;
         for (tagArmy &o : info.armies) {
-            if (o.Sort == AT_PRIEST || o.Sort == AT_SCOUT) continue;
-            if (o.SN == baitScoutSN || o.SN == weakKillSN) continue;
+            if (o.Sort == AT_PRIEST || army_is_scout(o)) continue;
+            if (army_is_scout(o) || o.SN == baitScoutSN || o.SN == weakKillSN) continue;
             const double d = calDistance(o.DR, o.UR, tx, ty);
             if (d < lineFrontDist) lineFrontDist = d;
         }
@@ -3555,12 +3649,12 @@ void demand_attack()
             double bowDR = 0, bowUR = 0, bowRange = 0; int bowCount = 0;
             double frontDist = 1e18;
             for (const tagArmy &a : info.armies) {
-                if (a.SN == baitScoutSN || a.SN == weakKillSN) continue;
+                if (army_is_scout(a) || a.SN == baitScoutSN || a.SN == weakKillSN) continue;
                 if (a.Sort != AT_BOWMAN && a.Sort != AT_COMPOSITE_BOWMAN) continue;
                 frontDist = std::min(frontDist, calDistance(a.DR, a.UR, tx, ty));
             }
             for (const tagArmy &a : info.armies) {
-                if (a.SN == baitScoutSN || a.SN == weakKillSN) continue;
+                if (army_is_scout(a) || a.SN == baitScoutSN || a.SN == weakKillSN) continue;
                 if (a.Sort != AT_BOWMAN && a.Sort != AT_COMPOSITE_BOWMAN) continue;
                 if (calDistance(a.DR, a.UR, tx, ty) > frontDist + 2 * bsl) continue;
                 bowDR += a.DR; bowUR += a.UR; bowRange += own_attack_range(a.Sort); ++bowCount;
@@ -3614,7 +3708,7 @@ void demand_attack()
     for (tagArmy &a : info.armies) {
         // 祭司的格位已在上面 7.0) 分配（特殊兵种：格位中心往家退 4 格）
         if (a.Sort == AT_PRIEST) continue;
-        if (a.Sort == AT_SCOUT) continue;   // 侦察骑兵只探路，不参加反攻
+        if (army_is_scout(a)) continue;   // 指定探图单位不参加反攻
         if (a.SN == weakKillSN) continue;
         if (a.SN == baitScoutSN) {
             if (!baitScoutBack) {
@@ -3775,12 +3869,12 @@ void demand_attack()
             double bowDR = 0, bowUR = 0; int bowCount = 0;
             double nearestBow = 1e18;
             for (const tagArmy &o : info.armies) {
-                if (o.SN == baitScoutSN || o.SN == weakKillSN) continue;
+                if (army_is_scout(o) || o.SN == baitScoutSN || o.SN == weakKillSN) continue;
                 if (o.Sort != AT_BOWMAN && o.Sort != AT_COMPOSITE_BOWMAN) continue;
                 nearestBow = std::min(nearestBow, calDistance(o.DR, o.UR, targetDR, targetUR));
             }
             for (const tagArmy &o : info.armies) {
-                if (o.SN == baitScoutSN || o.SN == weakKillSN) continue;
+                if (army_is_scout(o) || o.SN == baitScoutSN || o.SN == weakKillSN) continue;
                 if (o.Sort != AT_BOWMAN && o.Sort != AT_COMPOSITE_BOWMAN) continue;
                 if (calDistance(o.DR, o.UR, targetDR, targetUR) > nearestBow + 3 * bsl) continue;
                 bowDR += o.DR; bowUR += o.UR; ++bowCount;
@@ -3932,7 +4026,7 @@ void demand_attack()
         int nIdle = 0, nWalk = 0, nAtk = 0, nWork = 0;
         int nStaged = 0, nTotal = 0, nMoved = 0;
         for (tagArmy &a : info.armies) {
-            if (a.Sort == AT_PRIEST || a.Sort == AT_SCOUT) continue;
+            if (a.Sort == AT_PRIEST || army_is_scout(a)) continue;
             nTotal++;
             std::unordered_map<int,int>::iterator itStep = unitStepFrame.find(a.SN);
             if (itStep != unitStepFrame.end() && itStep->second == info.GameFrame) nMoved++;
@@ -4437,7 +4531,7 @@ void scout_retreat(tagArmy *priest)
     int gap = 500 / TimePerFrame;
     if (gap < 1) gap = 1;
     // 节流用"单位自己的"帧号：侦察骑兵和祭司各走各的，混用会互相拖慢
-    int &ordFrame = (priest->Sort == AT_SCOUT) ? scoutUnitOrderFrame : priestOrderFrame;
+    int &ordFrame = (priest->SN == scoutBowSN || priest->Sort == AT_SCOUT) ? scoutUnitOrderFrame : priestOrderFrame;
     if (ordFrame != 0 && info.GameFrame - ordFrame < gap) return;
     ordFrame = info.GameFrame;
 
@@ -4556,7 +4650,7 @@ bool priest_heal(tagArmy *priest)
     if (healTargetSN >= 0) {
         for (tagArmy &a : info.armies) {
             if (a.SN != healTargetSN) continue;
-            if (a.Sort != AT_PRIEST && a.Sort != AT_SCOUT
+            if (a.Sort != AT_PRIEST && !army_is_scout(a)
                 && a.MaxBlood > 0 && a.Blood < a.MaxBlood
                 && calDistance(priest->DR, priest->UR, a.DR, a.UR) <= maxDist
                 && nearHomeOk(a.DR, a.UR))          // ★ 跑出“家门口”就放弃它
@@ -4569,7 +4663,7 @@ bool priest_heal(tagArmy *priest)
         for (tagArmy &a : info.armies) {
             if (a.Sort == AT_PRIEST) continue;
             // 侦察骑兵不参与防御，也不占用祭司的治疗额度（它的命不值钱，主力兵值钱）
-            if (a.Sort == AT_SCOUT) continue;
+            if (army_is_scout(a)) continue;
             if (a.MaxBlood <= 0 || a.Blood >= a.MaxBlood) continue;   // 满血不用治
             if (!nearHomeOk(a.DR, a.UR)) continue;                    // ★ 不在家门口
             double d = calDistance(priest->DR, priest->UR, a.DR, a.UR);
@@ -4597,13 +4691,12 @@ bool priest_heal(tagArmy *priest)
 // 两段常量说明；没造出侦察兵时先由祭司代劳。
 void demand_scout()
 {
-    // 探路者：优先用侦察兵（速度 4.07），没有才退回祭司（2.24）。
-    // 用侦察兵探路还有个好处：祭司可以一直留在家里，治疗和转化都不用跑远。
+    // 第三阶段由指定普通弓兵执行原有探图；前期仍由祭司探索家附近。
     tagArmy *priest = nullptr;
     tagArmy *scout  = nullptr;
     for (tagArmy &a : info.armies) {
         if (a.Sort == AT_PRIEST) { priest = &a; continue; }
-        if (a.Sort == AT_SCOUT && scout == nullptr) scout = &a;
+        if (a.SN == scoutBowSN && scout == nullptr) scout = &a;
     }
     if (scout == nullptr) scout = priest;   // 还没造出侦察兵：只能让祭司去探
     if (scout == nullptr) return;           // 祭司也不在（死亡即游戏结束）
@@ -4832,6 +4925,9 @@ void assign_tasks()
         if (t.state != TASK_WAITING) continue;
 
         if (t.type == TASK_GATHER) {
+            if (t.resourceType == RESOURCE_GOLD && gold_worker_count() >= 3) {
+                t.state = TASK_DONE; continue;
+            }
             // ---- 农田特殊处理：只派"这块田的主人"，不随便挑空闲村民 ----
             if (t.resourceType == GATHER_FARM) {
                 int farmSN = -1, farmerSN = -1;
@@ -4903,6 +4999,7 @@ void assign_tasks()
                     best = 1e18;
                     for (tagResource &r : info.resources) {
                         if (r.Type != t.resourceType) continue;
+                        if (r.Type == RESOURCE_GOLD && !selected_gold(r.SN)) continue;
                         // 活动物（Cnt=0 但 Blood>0）也允许选中，用于打猎；尸体/普通资源看 Cnt
                         if (r.Cnt <= 0 && r.Blood <= 0) continue;
                         if (lockedRes.count(r.SN)) continue;
@@ -5011,6 +5108,11 @@ void assign_tasks()
                 if (b.Type == BUILDING_CENTER) { cx = b.BlockDR; cy = b.BlockUR; break; }
             }
 
+            if (t.goldAnchorSN >= 0) {
+                for (const tagResource &r : info.resources)
+                    if (r.SN == t.goldAnchorSN) { ax = r.BlockDR; ay = r.BlockUR; break; }
+                if (ax < 0) { t.state = TASK_FAILED; continue; }
+            }
             if (t.granaryFarm) {
                 double nearest = 1e18;
                 for (const tagBuilding &b : info.buildings) {
@@ -5079,6 +5181,9 @@ void assign_tasks()
                     if (cx >= 0 && bx < cx + 8 && bx + size > cx - 5
                         && by < cy + 8 && by + size > cy - 5) return;
                 }
+                if (t.goldAnchorSN >= 0 && calDistance((bx + size * 0.5) * BLOCKSIDELENGTH,
+                    (by + size * 0.5) * BLOCKSIDELENGTH, ax * BLOCKSIDELENGTH, ay * BLOCKSIDELENGTH)
+                    > 6 * BLOCKSIDELENGTH) return;
                 // 放得下吗（find_block 内部已含“建造位上有没有单位正站着”）
                 if (!find_block(bx, by, size, size)) return;
                 // 被内核驳回过、还在拉黑期的位置直接跳过，否则会反复挑中它、
@@ -5156,7 +5261,7 @@ void assign_tasks()
                 }
             }
             // 一次可达的都没找到 → 用之前记下的备选（宁可去碰运气，也不能不出门）
-            if (!t.granaryFarm && x == -1 && xBak != -1) { x = xBak; y = yBak; }
+            if (!t.granaryFarm && t.goldAnchorSN < 0 && x == -1 && xBak != -1) { x = xBak; y = yBak; }
             if (x == -1) continue;   // 找不到空地，保持等待
 
             if (t.granaryFarm) granaryFarmSites.insert((x << 12) | y);
@@ -5310,7 +5415,7 @@ static void recall_food_gatherers_to_farm()
                 const bool idle = f.NowState == HUMAN_STATE_IDLE;
                 const bool wild = type == RESOURCE_BUSH || type == RESOURCE_GAZELLE;
                 const bool wood = type == RESOURCE_TREE && woodWorkers > WOOD_MIN_GATHERERS;
-                const bool gold = type == RESOURCE_GOLD && (goldWorkers > 2 || !gold_needed());
+                const bool gold = type == RESOURCE_GOLD && (goldWorkers > 3 || !gold_needed());
                 if ((pass == 0 && (idle || wild)) || (pass == 1 && wood) || (pass == 2 && gold)) {
                     worker = f.SN; workerType = type; break;
                 }
@@ -5415,8 +5520,66 @@ static void pull_workers_to_stone()
     }
 }
 
+static void rebalance_gold_workers()
+{
+    if (phase < 2) return;
+    int kept = 0;
+    for (const tagFarmer &f : info.farmers) {
+        if (f.FarmerSort != FARMERTYPE_FARMER || on_build_task(f.SN) || farmer_just_ordered(f.SN)) continue;
+        int target = f.WorkObjectSN;
+        for (const Task &t : taskQueue)
+            if (t.type == TASK_GATHER && t.state == TASK_ASSIGNED && t.farmerSN == f.SN)
+                target = t.targetSN;
+        if (resource_type_by_sn(target) != RESOURCE_GOLD) continue;
+        if (selected_gold(target) && gold_needed() && kept < 3) { ++kept; continue; }
+        int newTarget = -1, newType = GATHER_FARM;
+        double best = 1e18;
+        if (gold_needed() && kept < 3) {
+            for (const tagResource &r : info.resources) {
+                if (r.Type != RESOURCE_GOLD || r.Cnt <= 0 || !selected_gold(r.SN)
+                    || gather_spot_dangerous(r.DR, r.UR, gather_danger_radius(r.Type))
+                    || gatherers_on(r.SN) >= std::min(3, res_stand_spots(r.SN))
+                    || !gather_target_reachable(f, r.SN, r.BlockDR, r.BlockUR, 1)) continue;
+                const double d = calDistance(f.DR, f.UR, r.DR, r.UR);
+                if (d < best) { best = d; newTarget = r.SN; newType = RESOURCE_GOLD; }
+            }
+        }
+        if (newTarget < 0) {
+            for (const tagBuilding &b : info.buildings) {
+                if (b.Type != BUILDING_FARM || b.Percent < 100 || b.Cnt <= 0) continue;
+                bool occupied = false;
+                for (const tagFarmer &other : info.farmers)
+                    if (other.SN != f.SN && other.WorkObjectSN == b.SN) occupied = true;
+                for (const Task &t : taskQueue)
+                    if (t.type == TASK_GATHER && t.state == TASK_ASSIGNED
+                        && t.targetSN == b.SN && t.farmerSN != f.SN) occupied = true;
+                if (occupied || !gather_target_reachable(f, b.SN, b.BlockDR, b.BlockUR, building_size(b.Type))) continue;
+                const double d = calDistance(f.DR, f.UR, b.BlockDR * BLOCKSIDELENGTH, b.BlockUR * BLOCKSIDELENGTH);
+                if (d < best) { best = d; newTarget = b.SN; newType = GATHER_FARM; }
+            }
+        }
+        for (Task &t : taskQueue)
+            if (t.type == TASK_GATHER && t.farmerSN == f.SN
+                && t.state != TASK_DONE && t.state != TASK_FAILED) t.state = TASK_DONE;
+        if (newTarget >= 0) {
+            HumanAction(f.SN, newTarget); mark_farmer_order(f.SN);
+            if (newType == GATHER_FARM) farmHolder[newTarget] = f.SN;
+            else ++kept;
+            Task t; t.id = nextTaskId++; t.type = TASK_GATHER; t.priority = 3;
+            t.resourceType = newType; t.targetSN = newTarget; t.farmerSN = f.SN;
+            t.state = TASK_ASSIGNED; t.startFrame = info.GameFrame; taskQueue.push_back(t);
+        } else {
+            send_gatherer_to_wood(f.SN);
+        }
+        DebugText(std::string("采金改派: 村民=") + std::to_string(f.SN)
+            + " 原目标=" + std::to_string(target) + " 新目标=" + std::to_string(newTarget)
+            + " 类型=" + (newType == RESOURCE_GOLD ? "锁定矿群" : newTarget >= 0 ? "农田" : "伐木兜底"));
+    }
+}
+
 void recycle_tasks()
 {
+    rebalance_gold_workers();
     if (stone_forbidden_now()) recall_stone_miners();
     if (phase >= 3) recall_food_gatherers_to_farm();
 
@@ -5942,7 +6105,7 @@ void combat_tactic()
     if (defenseGap < 1) defenseGap = 1;
     for (tagArmy &a : info.armies) {
         if (a.Sort == AT_PRIEST) continue;
-        if (a.Sort == AT_SCOUT) continue;
+        if (army_is_scout(a)) continue;
         bool reservedTarget = false;
         for (const tagArmy &e : info.enemy_armies)
             if (e.SN == a.WorkObjectSN && reserve_wave3_siege(e)) { reservedTarget = true; break; }
