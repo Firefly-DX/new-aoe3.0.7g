@@ -45,6 +45,7 @@ struct Task {
     int resourceType = -1;    // 采集：目标资源类型
     int targetSN = -1;        // 已锁定资源/敌人 SN
     int goldAnchorSN = -1;
+    int stoneAnchorSN = -1;
     bool granaryFarm = false; // 反攻新增农田，仅在谷仓周围选址
     int buildingType = -1;    // 建造/生产：建筑类型
     int blockDR = -1, blockUR = -1; // 建造位置
@@ -286,6 +287,7 @@ static bool res_too_far(int type, int blockDR, int blockUR);
 static bool gather_spot_dangerous(double dr, double ur, int radiusBlocks = 0);   // <=0 = 用默认半径
 static int  gold_demand();
 static bool gold_needed();
+static bool stone_needed();
 static void update_enemy_ledger();
 static int  enemy_remains();
 static int  enemy_ledger_total();
@@ -299,11 +301,16 @@ static void demand_gather();
 static int resource_type_by_sn(int sn);
 static bool gather_target_reachable(const tagFarmer &f, int sn, int bx, int by, int size);
 static std::set<int> goldCluster;
-static int goldAnchorSN = -1, goldClusterFrame = -1000000;
+static std::set<int> stoneCluster;
+static int goldAnchorSN = -1, stoneAnchorSN = -1, goldClusterFrame = -1000000, stoneClusterFrame = -1000000;
 static int gold_worker_count();
+static int mining_cluster_worker_count(int type);
+static bool selected_stone(int sn);
 static bool selected_gold(int sn);
 static void update_gold_cluster();
 static void rebalance_gold_workers();
+static bool selected_stone(int sn);
+static void update_stone_cluster();
 static void demand_army();
 static void init_researches();
 static void request_research(ResearchState &r);
@@ -768,7 +775,7 @@ void bt_sync()
         baitScoutSN = -1; baitScoutReturning = false; baitScoutSwitchFrame = 0;
         baitScoutBlood = -1; baitScoutBack = false; slowPushValid = false;
         lastAdvanceDR = -1; lastAdvanceUR = -1;
-        granaryFarmSites.clear(); goldCluster.clear(); goldAnchorSN = -1; goldClusterFrame = -1000000;
+        granaryFarmSites.clear(); goldCluster.clear(); stoneCluster.clear(); goldAnchorSN = -1; stoneAnchorSN = -1; goldClusterFrame = -1000000; stoneClusterFrame = -1000000;
         scoutBowSN = -1; scoutAssigned = false;
         scoutSeenAlive = false; scoutDeathPending = false;
         scoutLastDR = 0; scoutLastUR = 0;
@@ -821,6 +828,7 @@ void bt_sync()
         }
     }
     update_gold_cluster();
+    update_stone_cluster();
     record_enemy_positions();
     update_enemy_ledger();
 
@@ -1155,9 +1163,26 @@ static int gold_worker_count()
     return (int)workers.size();
 }
 
+static int mining_cluster_worker_count(int type)
+{
+    int n = 0;
+    for (const tagFarmer &f : info.farmers) {
+        if (f.FarmerSort != FARMERTYPE_FARMER
+            || resource_type_by_sn(f.WorkObjectSN) != type) continue;
+        if ((type == RESOURCE_GOLD && selected_gold(f.WorkObjectSN))
+            || (type == RESOURCE_STONE && selected_stone(f.WorkObjectSN))) ++n;
+    }
+    for (const Task &t : taskQueue)
+        if (t.type == TASK_GATHER && t.state == TASK_ASSIGNED
+            && t.resourceType == type && t.farmerSN >= 0) ++n;
+    return n;
+}
+
 static void update_gold_cluster()
 {
-    if (phase < 2 || info.GameFrame - goldClusterFrame < 2000 / std::max(1, TimePerFrame)) return;
+    const int goldStart = (10 * 60 * 1000) / std::max(1, TimePerFrame);
+    if (info.GameFrame < goldStart
+        || info.GameFrame - goldClusterFrame < 2000 / std::max(1, TimePerFrame)) return;
     goldClusterFrame = info.GameFrame;
     std::vector<const tagResource*> mines;
     for (const tagResource &r : info.resources)
@@ -1197,9 +1222,10 @@ static void update_gold_cluster()
                         (b.BlockDR + 1.5) * BLOCKSIDELENGTH, (b.BlockUR + 1.5) * BLOCKSIDELENGTH));
         }
         if (!anchor) continue;
-        const double score = (gatherSlots < 3 ? 10000 : 0)
-            + (warehouseDist > 7 * BLOCKSIDELENGTH ? 1000 : 0)
-            + homeDist / BLOCKSIDELENGTH - std::min(amount, 10000) * 0.001;
+        // 有仓库时按矿群到仓库距离选；没有仓库时才退化为离基地距离。
+        const double score = (warehouseDist < 1e18)
+            ? warehouseDist / BLOCKSIDELENGTH
+            : 100000.0 + homeDist / BLOCKSIDELENGTH;
         if (score >= best) continue;
         best = score; goldCluster.clear();
         for (const tagResource *r : group) goldCluster.insert(r->SN);
@@ -1207,6 +1233,57 @@ static void update_gold_cluster()
     }
     DebugText(std::string("采金矿群: 锚点=") + std::to_string(goldAnchorSN)
         + " 矿块数=" + std::to_string(goldCluster.size()) + " 人数上限=3");
+}
+
+static bool selected_stone(int sn) { return stoneCluster.count(sn) != 0; }
+
+static void update_stone_cluster()
+{
+    const int stoneStart = (4 * 60 * 1000) / std::max(1, TimePerFrame);
+    if (info.GameFrame < stoneStart
+        || info.GameFrame - stoneClusterFrame < 2000 / std::max(1, TimePerFrame)) return;
+    stoneClusterFrame = info.GameFrame;
+    std::vector<const tagResource*> stones;
+    for (const tagResource &r : info.resources)
+        if (r.Type == RESOURCE_STONE && r.Cnt > 0 && res_stand_spots(r.SN) > 0)
+            stones.push_back(&r);
+    if (stones.empty()) { stoneCluster.clear(); stoneAnchorSN = -1; return; }
+    std::set<int> visited, bestCluster; double bestScore = 1e18; int bestAnchor = -1;
+    double homeDR = 0, homeUR = 0; home_center(homeDR, homeUR);
+    for (const tagResource *seed : stones) {
+        if (visited.count(seed->SN)) continue;
+        std::vector<const tagResource*> group(1, seed); visited.insert(seed->SN);
+        for (size_t i = 0; i < group.size(); ++i)
+            for (const tagResource *r : stones)
+                if (!visited.count(r->SN)
+                    && calDistance(group[i]->DR, group[i]->UR, r->DR, r->UR) <= 4 * BLOCKSIDELENGTH) {
+                    visited.insert(r->SN); group.push_back(r);
+                }
+        const tagResource *anchor = nullptr;
+        double homeDist = 1e18, warehouseDist = 1e18;
+        for (const tagResource *r : group) {
+            if (res_too_far(r->Type, r->BlockDR, r->BlockUR)) continue;
+            const double d = calDistance(homeDR, homeUR, r->DR, r->UR);
+            if (d < homeDist) { homeDist = d; anchor = r; }
+            for (const tagBuilding &b : info.buildings)
+                if (b.Type == BUILDING_STOCK && b.Percent >= 100)
+                    warehouseDist = std::min(warehouseDist, calDistance(r->DR, r->UR,
+                        (b.BlockDR + 1.5) * BLOCKSIDELENGTH,
+                        (b.BlockUR + 1.5) * BLOCKSIDELENGTH));
+        }
+        if (anchor == nullptr) continue;
+        const double score = (warehouseDist < 1e18)
+            ? warehouseDist / BLOCKSIDELENGTH
+            : 100000.0 + homeDist / BLOCKSIDELENGTH;
+        if (score < bestScore) {
+            bestScore = score; bestCluster.clear();
+            for (const tagResource *r : group) bestCluster.insert(r->SN);
+            bestAnchor = anchor->SN;
+        }
+    }
+    stoneCluster = bestCluster; stoneAnchorSN = bestAnchor;
+    DebugText(std::string("采石矿群: 锚点=") + std::to_string(stoneAnchorSN)
+        + " 矿块数=" + std::to_string(stoneCluster.size()));
 }
 
 void demand_build()
@@ -1362,8 +1439,18 @@ void demand_build()
     }
 
 
-    if (phase >= 2 && goldAnchorSN >= 0 && gold_needed()
+    auto stockTaskAt = [&](int anchorSN) {
+        for (const Task &q : taskQueue)
+            if (q.type == TASK_BUILD && q.buildingType == BUILDING_STOCK
+                && q.state != TASK_DONE && q.state != TASK_FAILED
+                && ((anchorSN >= 0 && q.goldAnchorSN == anchorSN)
+                    || (anchorSN >= 0 && q.stoneAnchorSN == anchorSN))) return true;
+        return false;
+    };
+    if (info.GameFrame >= (4 * 60 * 1000) / std::max(1, TimePerFrame)
+        && goldAnchorSN >= 0
         && active_build(BUILDING_STOCK) == 0
+        && !stockTaskAt(goldAnchorSN)
         && woodBudget >= pending_build_wood() + BUILD_STOCK_WOOD) {
         bool nearby = false;
         for (const tagResource &r : info.resources) {
@@ -1374,10 +1461,31 @@ void demand_build()
                     <= 7 * BLOCKSIDELENGTH) nearby = true;
         }
         if (!nearby) {
-            Task t; t.id = nextTaskId++; t.type = TASK_BUILD; t.priority = 2;
+            Task t; t.id = nextTaskId++; t.type = TASK_BUILD; t.priority = 1;
             t.buildingType = BUILDING_STOCK; t.goldAnchorSN = goldAnchorSN;
             taskQueue.push_back(t);
-            DebugText(std::string("矿群补仓库: 锚点=") + std::to_string(goldAnchorSN));
+            DebugText(std::string("仓库任务创建: 类型=金 任务=") + std::to_string(t.id)
+                + " 锚点=" + std::to_string(goldAnchorSN));
+        }
+    }
+    if (info.GameFrame >= (10 * 60 * 1000) / std::max(1, TimePerFrame)
+        && stoneAnchorSN >= 0
+        && active_build(BUILDING_STOCK) == 0
+        && !stockTaskAt(stoneAnchorSN)
+        && woodBudget >= pending_build_wood() + BUILD_STOCK_WOOD) {
+        bool nearby = false;
+        for (const tagResource &r : info.resources) if (selected_stone(r.SN))
+            for (const tagBuilding &b : info.buildings)
+                if (b.Type == BUILDING_STOCK
+                    && calDistance(r.DR, r.UR, (b.BlockDR + 1.5) * BLOCKSIDELENGTH,
+                                   (b.BlockUR + 1.5) * BLOCKSIDELENGTH) <= 7 * BLOCKSIDELENGTH)
+                    nearby = true;
+        if (!nearby) {
+            Task t; t.id = nextTaskId++; t.type = TASK_BUILD; t.priority = 1;
+            t.buildingType = BUILDING_STOCK; t.stoneAnchorSN = stoneAnchorSN;
+            taskQueue.push_back(t);
+            DebugText(std::string("仓库任务创建: 类型=石 任务=") + std::to_string(t.id)
+                + " 锚点=" + std::to_string(stoneAnchorSN));
         }
     }
 }
@@ -1542,7 +1650,7 @@ static bool stone_forbidden_now()
     return (long long)info.GameFrame * tpf >= (long long)STONE_STOP_MIN * 60000;
 }
 
-bool stone_needed()
+static bool stone_needed()
 {
     // 硬闸放在这里，是为了让**所有**路径一次到位：demand_gather 的派人数（wantStone）、
     //   兜底 1/兜底 2 的石料候选、recycle_tasks 的“石头够了就回收”读的都是它。
@@ -1826,6 +1934,7 @@ void demand_gather()
                         continue;   // 浆果阶段结束 / 14:00 后不再采浆果
                     // 需求为零的资源不当候选（“后期石头太多”：塔建满、石堆成山还去挖）
                     if (r.Type == RESOURCE_STONE && !needStone) continue;
+                    if (r.Type == RESOURCE_STONE && !selected_stone(r.SN)) continue;
                     if (r.Type == RESOURCE_GOLD
                         && (wantGold == 0 || gold_worker_count() >= 3 || !selected_gold(r.SN))) continue;
                     if (res_too_far(r.Type, r.BlockDR, r.BlockUR)) continue;   // 太远：不采
@@ -1840,7 +1949,9 @@ void demand_gather()
                         if (cutterAtTree[r.SN] + sentNow[r.SN] >= spots) continue;
                     }
                     double haul = nearest_dropoff_dist(r.Type, r.DR, r.UR);
-                    double d = calDistance(f.DR, f.UR, r.DR, r.UR);
+                    const bool mine = r.Type == RESOURCE_GOLD || r.Type == RESOURCE_STONE;
+                    // 金矿/石矿的选点以仓库到矿点距离为主，不按村民当前位置抢矿。
+                    double d = mine ? haul : calDistance(f.DR, f.UR, r.DR, r.UR);
                     if (pass == 0) {
                         if (usedHere < anyUsed
                             || (usedHere == anyUsed && haul < anyHaul)
@@ -4928,6 +5039,10 @@ void assign_tasks()
             if (t.resourceType == RESOURCE_GOLD && gold_worker_count() >= 3) {
                 t.state = TASK_DONE; continue;
             }
+            if ((t.resourceType == RESOURCE_GOLD || t.resourceType == RESOURCE_STONE)
+                && mining_cluster_worker_count(t.resourceType) >= 3) {
+                t.state = TASK_DONE; continue;
+            }
             // ---- 农田特殊处理：只派"这块田的主人"，不随便挑空闲村民 ----
             if (t.resourceType == GATHER_FARM) {
                 int farmSN = -1, farmerSN = -1;
@@ -5005,8 +5120,9 @@ void assign_tasks()
                         if (lockedRes.count(r.SN)) continue;
                         if (res_too_far(r.Type, r.BlockDR, r.BlockUR)) continue;  // 太远：不采
                         if (gather_spot_dangerous(r.DR, r.UR, gather_danger_radius(r.Type))) continue;  // 危险：不派
-                        int spots = res_stand_spots(r.SN);
-                        if (spots <= 0) continue;          // 够不到：任何时候都不派
+                        const bool mining = (r.Type == RESOURCE_GOLD || r.Type == RESOURCE_STONE);
+                        int spots = mining ? 3 : res_stand_spots(r.SN);
+                        if (spots <= 0) continue;          // 非矿产资源仍需检查采集位
                         if (!gather_target_reachable(*f, r.SN, r.BlockDR, r.BlockUR, 1)) continue;
                         const int used = gatherers_on(r.SN);
                         if (pass == 0) {
@@ -5016,9 +5132,12 @@ void assign_tasks()
                         double haul = nearest_dropoff_dist(t.resourceType, r.DR, r.UR);
                         double d = calDistance(f->DR, f->UR, r.DR, r.UR);
                         if (pass == 0) {
-                            if (used < bestUsed
-                                || (used == bestUsed && haul < bestHaul)
-                                || (used == bestUsed && haul == bestHaul && d < best))
+                            if (mining
+                                ? (haul < bestHaul
+                                   || (haul == bestHaul && used < bestUsed))
+                                : (used < bestUsed
+                                   || (used == bestUsed && haul < bestHaul)
+                                   || (used == bestUsed && haul == bestHaul && d < best)))
                             { bestUsed = used; bestHaul = haul; best = d; resSN = r.SN; }
                         } else if (haul < bestHaul || (haul == bestHaul && d < best)) {
                             // 第二遍是“只剩这些点了、硬挤也要上”的兜底，按距离挑就行
@@ -5038,6 +5157,22 @@ void assign_tasks()
         }
         else if (t.type == TASK_BUILD) {
             tagFarmer *f = find_idle(&t);
+            // 仓库是矿区基础设施；没有空闲村民时，强制释放一名打猎村民。
+            // 只对仓库生效，避免普通建筑打断食物生产。
+            if (f == nullptr && t.buildingType == BUILDING_STOCK) {
+                for (tagFarmer &hunter : info.farmers) {
+                    if (hunter.FarmerSort != FARMERTYPE_FARMER
+                        || assignedThisFrame.count(hunter.SN)
+                        || on_build_task(hunter.SN)) continue;
+                    if (resource_type_by_sn(hunter.WorkObjectSN) != RESOURCE_GAZELLE) continue;
+                    const auto bad = t.badBuilders.find(hunter.SN);
+                    if (bad != t.badBuilders.end() && bad->second > info.GameFrame) continue;
+                    f = &hunter;
+                    DebugText(std::string("仓库强制释放猎手: 任务=") + std::to_string(t.id)
+                        + " 村民=" + std::to_string(f->SN));
+                    break;
+                }
+            }
             if (f == nullptr) continue;
 
             if (t.blockDR != -1) {
@@ -5111,6 +5246,11 @@ void assign_tasks()
             if (t.goldAnchorSN >= 0) {
                 for (const tagResource &r : info.resources)
                     if (r.SN == t.goldAnchorSN) { ax = r.BlockDR; ay = r.BlockUR; break; }
+                if (ax < 0) { t.state = TASK_FAILED; continue; }
+            }
+            if (t.stoneAnchorSN >= 0) {
+                for (const tagResource &r : info.resources)
+                    if (r.SN == t.stoneAnchorSN) { ax = r.BlockDR; ay = r.BlockUR; break; }
                 if (ax < 0) { t.state = TASK_FAILED; continue; }
             }
             if (t.granaryFarm) {
@@ -5234,6 +5374,14 @@ void assign_tasks()
             int startR = CENTER_BUILD_START_R;
             int step   = 4;
             if (t.resourceType != -1) startR = 2;
+            // 矿区仓库必须贴近矿群逐格找位置，不能沿用基地建筑从 8 格外
+            // 开始、每 4 格跳搜的规则；否则金矿的 6 格距离限制会把所有
+            // 候选点排除掉。
+            if (t.buildingType == BUILDING_STOCK
+                && (t.goldAnchorSN >= 0 || t.stoneAnchorSN >= 0)) {
+                startR = 1;
+                step = 1;
+            }
             if (t.buildingType == BUILDING_HOME) startR = 4;
             // 箭塔：从锚点（已有箭塔）边上 3 格开始、每 2 格一圈地找，尽量贴着建
             if (t.buildingType == BUILDING_ARROWTOWER) { startR = 3; step = 2; }
@@ -5261,7 +5409,7 @@ void assign_tasks()
                 }
             }
             // 一次可达的都没找到 → 用之前记下的备选（宁可去碰运气，也不能不出门）
-            if (!t.granaryFarm && t.goldAnchorSN < 0 && x == -1 && xBak != -1) { x = xBak; y = yBak; }
+            if (!t.granaryFarm && x == -1 && xBak != -1) { x = xBak; y = yBak; }
             if (x == -1) continue;   // 找不到空地，保持等待
 
             if (t.granaryFarm) granaryFarmSites.insert((x << 12) | y);
@@ -5271,6 +5419,12 @@ void assign_tasks()
             t.farmerSN = f->SN;
             t.state = TASK_ASSIGNED;
             t.startFrame = info.GameFrame;
+            if (t.buildingType == BUILDING_STOCK) {
+                DebugText(std::string("仓库任务分配: 任务=") + std::to_string(t.id)
+                    + " 村民=" + std::to_string(f->SN)
+                    + " 指令=" + std::to_string(t.targetSN)
+                    + " 坐标=(" + std::to_string(x) + "," + std::to_string(y) + ")");
+            }
             assignedThisFrame.insert(f->SN);
 
             for (int i = x; i < x + size; i++)
@@ -5484,7 +5638,7 @@ static void pull_workers_to_stone()
             int resSN = -1;
             double bestD = 1e18;
             for (tagResource &r : info.resources) {
-                if (r.Type != RESOURCE_STONE || r.Cnt <= 0) continue;
+                if (r.Type != RESOURCE_STONE || r.Cnt <= 0 || !selected_stone(r.SN)) continue;
                 if (res_too_far(r.Type, r.BlockDR, r.BlockUR)) continue;
                 if (gather_spot_dangerous(r.DR, r.UR,
                                           gather_danger_radius(r.Type))) continue;
@@ -5577,9 +5731,28 @@ static void rebalance_gold_workers()
     }
 }
 
+static void rebalance_stone_workers()
+{
+    int kept = 0;
+    for (tagFarmer &f : info.farmers) {
+        if (f.FarmerSort != FARMERTYPE_FARMER
+            || resource_type_by_sn(f.WorkObjectSN) != RESOURCE_STONE
+            || !selected_stone(f.WorkObjectSN)) continue;
+        if (on_build_task(f.SN) || farmer_just_ordered(f.SN)) continue;
+        if (kept++ < 3) continue;
+        for (Task &t : taskQueue)
+            if (t.type == TASK_GATHER && t.resourceType == RESOURCE_STONE
+                && t.farmerSN == f.SN && t.state != TASK_DONE
+                && t.state != TASK_FAILED) t.state = TASK_DONE;
+        send_gatherer_to_wood(f.SN);
+        DebugText(std::string("采石超员改派: 村民=") + std::to_string(f.SN));
+    }
+}
+
 void recycle_tasks()
 {
     rebalance_gold_workers();
+    rebalance_stone_workers();
     if (stone_forbidden_now()) recall_stone_miners();
     if (phase >= 3) recall_food_gatherers_to_farm();
 
@@ -5708,6 +5881,21 @@ void recycle_tasks()
             if (t.targetSN >= 0 && info.ins_ret.count(t.targetSN)) {
                 int ret = info.ins_ret[t.targetSN];
                 if (ret != 0) {
+                    if (t.type == TASK_BUILD && t.buildingType == BUILDING_STOCK)
+                        DebugText(std::string("仓库回执失败: 任务=") + std::to_string(t.id)
+                            + " 指令=" + std::to_string(t.targetSN)
+                            + " ret=" + std::to_string(ret)
+                            + " 坐标=(" + std::to_string(t.blockDR) + ","
+                            + std::to_string(t.blockUR) + ")");
+                    // 仓库位置一旦选定就锁定；暂时被村民/路径占用时只重试原坐标，
+                    // 不标记失败、不拉黑位置，也不重新选择矿群。
+                    if (t.type == TASK_BUILD && t.buildingType == BUILDING_STOCK) {
+                        t.state = TASK_WAITING;
+                        t.targetSN = -1;
+                        t.farmerSN = -1;
+                        t.resendFrame = 0;
+                        continue;
+                    }
                     t.state = TASK_FAILED;
                     // "选址被否"类的错误（有重叠/越界/未探索/高度差/位置不合适…）：
                     // 把这块地拉黑一段时间，否则下一帧位置搜索还会挑中它，无限重试。
@@ -5732,6 +5920,9 @@ void recycle_tasks()
                         && b.BlockUR == t.blockUR && b.Percent >= 100) {
                         t.state = TASK_DONE;
                         builtSN = b.SN;
+                        if (t.buildingType == BUILDING_STOCK)
+                            DebugText(std::string("仓库建成: 任务=") + std::to_string(t.id)
+                                + " SN=" + std::to_string(b.SN));
                         break;
                     }
                 }
@@ -5803,7 +5994,16 @@ void recycle_tasks()
             // 3) 超时
             if (t.state != TASK_DONE && t.state != TASK_FAILED
                 && info.GameFrame - t.startFrame > 60 * 120)
+            {
+                if (t.buildingType == BUILDING_STOCK)
+                    DebugText(std::string("仓库任务超时: 任务=") + std::to_string(t.id)
+                        + " 状态=" + std::to_string(t.state)
+                        + " 村民=" + std::to_string(t.farmerSN)
+                        + " 指令=" + std::to_string(t.targetSN)
+                        + " 坐标=(" + std::to_string(t.blockDR) + ","
+                        + std::to_string(t.blockUR) + ")");
                 t.state = TASK_FAILED;
+            }
 
             if (t.blockDR != -1
                 && (t.state == TASK_FAILED
